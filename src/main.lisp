@@ -134,6 +134,14 @@
            (parse-rizinil value2)))
     (_ (error (format nil "Parse failed ~a~%" expr)))))
 
+(defun get-rizinil (off)
+  (parse-rizinil
+   (read-from-string
+    (reduce (lambda (res cur)
+              (cl-ppcre:regex-replace-all (car cur) res (cdr cur)))
+            '(("\\~-" . "neg") ("\\~" . "not") ("\\|"  . "or") ("0x"   . "#x"))
+            :initial-value (nth-value 1 (get-offset-and-isn (rizin:il *rizin* :offset off)))))))
+
 (defun mark-vmp-ins (origin-ins insn-mem insn-index cur-insn vmp-info expr)
   ;; (format t "vmp-info: ~a~%" vmp-info)
   ;; (format t "insn rizinil: ~a~%" expr)
@@ -168,22 +176,20 @@
             (highlight-and-update-vmp-info :insn-index operand1 operand2))
            ;; operand1 will contain new value, so need remove old info about operand1
            ;; remove old, then add new
-           (t (loop for (key value) on '(:insn-mem () :insn-index () :insn () :op ()) by #'cddr
+           (t (loop for key in '(:insn-mem :insn-index :insn :op)
                     do (when (exists-in-vmp-info key operand1)
-                         (remove-vmp-info key operand1)))
-              (loop for (key value) on '(:insn-mem () :insn-index () :insn () :op ()) by #'cddr
-                    do (when (exists-in-vmp-info key operand2)
+                         (remove-vmp-info key operand1))
+                       (when (exists-in-vmp-info key operand2)
                          (highlight-and-update-vmp-info key operand1 operand2))))))
         ((list* 'branch operand _)
          (when (find-tree operand vmp-info :test #'equal)
            (highlight-insn)))
         ((list* 'seq operands)
          ;; seq is multi expr, so need recursive call
-         (mapcar (lambda (e)
-                   (setf new-vmp-info
-                         ;; new-vmp-info will update every il expr, so need use new-vmp-info
-                         (mark-vmp-ins origin-ins insn-mem insn-index cur-insn new-vmp-info e)))
-                 operands))))
+         (loop for e in operands
+               do (setf new-vmp-info
+                        ;; new-vmp-info will update every il expr, so need use new-vmp-info
+                        (mark-vmp-ins origin-ins insn-mem insn-index cur-insn new-vmp-info e))))))
     new-vmp-info))
 
 (defun mark-vmp (links &key
@@ -195,54 +201,37 @@
                          (vmp-info '(:insn-mem () :insn-index () :insn () :op ()))
                          (visited (make-hash-table :test 'equal)))
   "Mark instruction related to vmp. Add color in links attribute."
+  ;; if visited is list, it will be simple, but will lose some mark (link direct between different operator)
+  ;; 1. simple check (not (member cur-insn visited))
+  ;; 2. simple push alreay visited insn (push cur-insn visited)
+  ;; 3. recurive call mark-vmp need copy: (copy-tree visited)
   (let* ((*package* (find-package :trace-analyse)))
     (loop while (let ((cur-visited (gethash cur-insn visited)))
-                  (prog1
-                      (not (and cur-visited
-                                (subsetp (getf vmp-info :insn-mem) (getf cur-visited :insn-mem) :test 'equal)
-                                (subsetp (getf vmp-info :insn-index) (getf cur-visited :insn-index) :test 'equal)
-                                (subsetp (getf vmp-info :insn) (getf cur-visited :insn) :test 'equal)
-                                (subsetp (getf vmp-info :op) (getf cur-visited :op) :test 'equal)))
-                    (setf (gethash cur-insn visited)
-                          (let ((cur-visited (gethash cur-insn visited (list :insn-mem () :insn-index () :insn () :op ()))))
-                            (list :insn-mem (union (getf vmp-info :insn-mem) (getf cur-visited :insn-mem)  :test 'equal)
-                                  :insn-index (union (getf vmp-info :insn-index) (getf cur-visited :insn-index) :test 'equal)
-                                  :insn (union (getf vmp-info :insn) (getf cur-visited :insn) :test 'equal)
-                                  :op (union (getf vmp-info :op) (getf cur-visited :op) :test 'equal))))))
-          ;; (not (member cur-insn visited))
+                  (not (and cur-visited
+                            (loop for key in '(:insn-mem :insn-index :insn :op)
+                                  always (subsetp (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
           do (multiple-value-bind (off insn) (get-offset-and-isn cur-insn)
                (declare (ignore insn))
-               ;; (format t "~x " off)
-               (setf vmp-info
-                     (mark-vmp-ins (gethash cur-insn links)
-                                   insn-mem insn-index cur-insn vmp-info
-                                   (parse-rizinil
-                                    (read-from-string
-                                     (reduce (lambda (res cur)
-                                               (cl-ppcre:regex-replace-all (car cur) res (cdr cur)))
-                                             '(("\\~-" . "neg") ("\\~" . "not") ("\\|"  . "or") ("0x"   . "#x"))
-                                             :initial-value (nth-value 1 (get-offset-and-isn (rizin:il *rizin* :offset off))))))))
-               ;; (push cur-insn visited)
+               (setf vmp-info (mark-vmp-ins (gethash cur-insn links)
+                                            insn-mem insn-index cur-insn vmp-info
+                                            (get-rizinil off)))
+               (setf (gethash cur-insn visited)
+                     (let ((cur-visited (gethash cur-insn visited (list :insn-mem () :insn-index () :insn () :op ()))))
+                       (loop for key in '(:insn-mem :insn-index :insn :op)
+                             append (list key (union (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
                (let ((nexts (getf (gethash cur-insn links) :next)))
                  (when (car nexts)
                    (setf cur-insn (car nexts)))
-                 (mapc (lambda (next)
-                         (mark-vmp links
-                                   :insn-mem insn-mem
-                                   :insn-index insn-index
-                                   :cur-insn next
-                                   :vmp-info (copy-tree vmp-info)
-                                   :visited visited
-                                   ;; (copy-tree visited)
-                                   ))
-                       (cdr nexts)))))
+                 (loop for next in (cdr nexts)
+                       do (mark-vmp links
+                                    :insn-mem insn-mem
+                                    :insn-index insn-index
+                                    :cur-insn next
+                                    :vmp-info (copy-tree vmp-info)
+                                    :visited visited)))))
     links))
 
-;; (defun mark-vmp (links &key
-;;                          ;; (insn-mem "0x194f0 and x12, x11, #0xffff")
-;;                          ;; (vmp-info '(:insn-mem (x0) :insn-index () :insn () :op ()))
-
-;;                          (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
+;; (defun mark-vmp (links &key (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
 ;;                          (insn-index "0x10e520 str x13, [x19, #0x68]")
 ;;                          (vmp-info '(:insn-mem () :insn-index () :insn () :op ())))
 ;;   (let ((*package* (find-package :trace-analyse)))
@@ -253,19 +242,9 @@
 ;;             when (uiop:string-prefix-p "0x" cur-insn)
 ;;               do (multiple-value-bind (off insn) (get-offset-and-isn cur-insn)
 ;;                    (declare (ignore insn))
-;;                    (format t "~x " off)
-;;                    (setf vmp-info
-;;                          (mark-vmp-ins (gethash cur-insn links)
-;;                                        insn-mem insn-index cur-insn vmp-info
-;;                                        (parse-rizinil
-;;                                         (read-from-string
-;;                                          (reduce (lambda (res cur)
-;;                                                    (cl-ppcre:regex-replace-all (car cur) res (cdr cur)))
-;;                                                  '(("\\~-" . "neg")
-;;                                                    ("\\~" . "not")
-;;                                                    ("\\|"  . "or")
-;;                                                    ("0x"   . "#x"))
-;;                                                  :initial-value (nth-value 1 (get-offset-and-isn (rizin:il *rizin* :offset off)))))))))
+;;                    (setf vmp-info (mark-vmp-ins (gethash cur-insn links)
+;;                                                 insn-mem insn-index cur-insn vmp-info
+;;                                                 (get-rizinil off))))
 ;;             finally (return links)))))
 
 (defclass cfg ()
@@ -315,7 +294,6 @@
     ;;          links)
     (when output-file
       (cl-dot:dot-graph dgraph output-file :format :svg))
-    ;; (format t "~s~%" (ms:marshal group-nodes))
     (rizin:quit *rizin*)
 
     (values links group-nodes)))
