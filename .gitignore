@@ -10,5 +10,6 @@
 
 test-code/
 resources/
+tests/suit
 analyse
-test-lr.svg
+*.svg

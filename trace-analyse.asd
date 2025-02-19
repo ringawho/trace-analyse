@@ -10,7 +10,8 @@
   :build-pathname "analyse"
   :entry-point "trace-analyse:main"
 
-  :depends-on (:uiop :cl-dot :trace-analyse/capstone)
+  :depends-on (:uiop :cl-dot :cl-ppcre :trivia
+               :trace-analyse/capstone :trace-analyse/rizin)
   :components ((:module "src"
                 :components
                 ((:file "main"))))
@@ -19,8 +20,7 @@
 (defsystem "trace-analyse/tests"
   :author ""
   :license ""
-  :depends-on ("trace-analyse"
-               "rove")
+  :depends-on (:trace-analyse :rove :marshal)
   :components ((:module "tests"
                 :components
                 ((:file "main"))))
@@ -32,7 +32,7 @@
   :author "ring"
   :license ""
   :depends-on (:uiop :cffi :alexandria :trivia)
-  :defsystem-depends-on ("cffi-grovel")
+  ;; :defsystem-depends-on ("cffi-grovel")
   :components ((:module "capstone"
                 :components
                 ((:file "package")
@@ -41,4 +41,14 @@
                  (:file "arm64-ffi")
                  (:file "ffi")
                  (:file "capstone"))))
+  :description "")
+
+(defsystem "trace-analyse/rizin"
+  :version "0.0.1"
+  :author "ring"
+  :license ""
+  :depends-on (:uiop)
+  :components ((:module "rizin"
+                :components
+                ((:file "rizin"))))
   :description "")

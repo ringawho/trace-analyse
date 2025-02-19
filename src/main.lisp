@@ -3,24 +3,26 @@
   (:export #:main))
 (in-package #:trace-analyse)
 
-(defun get-ins-info ()
+(defparameter *rizin* nil)
+
+(defmacro adjoin-plist-item (lst key item)
+  `(setf (getf ,lst ,key)
+         (adjoin ,item (getf ,lst ,key) :test 'equal)))
+
+(defun get-ins-info (trace-file)
   (let ((links (make-hash-table :test 'equal))
         previous)
-    ;; (with-open-file (stream "./output-310bcc.txt" :direction :input)
-    (with-open-file (stream "resources/output-10e414-first.txt" :direction :input)
+    (with-open-file (stream trace-file :direction :input)
       (loop for line = (read-line stream nil nil)
             while line
             when (uiop:string-prefix-p "0x" line)
-              do
-                 (unless (gethash line links)
-                   (setf (gethash line links) (list :prev nil :next nil :attr '((:color "#990073")))))
+              do (unless (gethash line links)
+                   (setf (gethash line links) (list :prev nil :next nil :attr nil)))
                  (when previous
                    (let ((prev-entry (gethash previous links))
                          (curr-entry (gethash line links)))
-                     (setf (getf prev-entry :next)
-                           (adjoin line (getf prev-entry :next) :test 'equal))
-                     (setf (getf curr-entry :prev)
-                           (adjoin previous (getf curr-entry :prev) :test 'equal))))
+                     (adjoin-plist-item prev-entry :next line)
+                     (adjoin-plist-item curr-entry :prev previous)))
                  (setf previous line)
             finally (return links)))))
 
@@ -65,6 +67,207 @@
       (read-sequence buffer stream)
       buffer)))
 
+(defun get-offset-and-isn (insn)
+  (destructuring-bind (offset ins) (cl-ppcre:split " " insn :limit 2)
+    (values (parse-integer offset :start 2 :radix 16)
+            ins)))
+
+(defun find-tree (node tree &key (test #'eql))
+  (if (atom tree)
+      (funcall test node tree)
+      (or (funcall test node tree)
+          (find-tree node (car tree) :test test)
+          (find-tree node (cdr tree) :test test))))
+
+(defun parse-rizinil (expr)
+  (trivia:match expr
+    ((list 'set reg value)
+     (list 'set reg (parse-rizinil value)))
+    ((list 'storew _ to value)
+     (list 'set (parse-rizinil to) (parse-rizinil value)))
+
+    ;; unwrap
+    ((list 'loadw _ _ value)
+     (list 'mem (parse-rizinil value)))
+    ((list 'load _ value)
+     (list 'mem (parse-rizinil value)))
+    ((list 'var value) value)
+    ((list 'msb value) value)
+    ((list 'is_zero value) (list 'zerop (parse-rizinil value)))
+    ((list '! value) (list '! (parse-rizinil value)))
+    ((list 'neg value) (list 'neg (parse-rizinil value)))
+    ((list 'not value) (list 'not (parse-rizinil value)))
+    ((list 'bv _ value) value)
+    ((list 'cast bit-num _ value)
+     (if (= bit-num 64)
+         (parse-rizinil value)
+         (list 'cast bit-num (parse-rizinil value))))
+
+    ;; unused
+    ((list 'jmp offset) (list 'jump (parse-rizinil offset)))
+    ('nop nil)
+    ((list 'branch condition true-branch false-branch)
+     (list 'branch (parse-rizinil condition)
+           (parse-rizinil true-branch) (parse-rizinil false-branch)))
+
+    ((list 'ite condition true-branch false-branch)
+     (list 'ite (parse-rizinil condition)
+           (parse-rizinil true-branch) (parse-rizinil false-branch)))
+
+    ;; complex
+    ((list* 'seq operands)
+     (apply #'list 'seq (mapcar #'parse-rizinil operands)))
+    ((list 'let var value body)
+     (subst (parse-rizinil value)
+            var
+            (parse-rizinil body)
+            :test 'equal))
+
+    ;; calc
+    ((trivia:guard (list* op value1 value2 _)
+                   (member op '(+ - *
+                                >> <<
+                                & or ^ ule oror
+                                && ^^)))
+     (list op
+           (parse-rizinil value1)
+           (parse-rizinil value2)))
+    (_ (error (format nil "Parse failed ~a~%" expr)))))
+
+(defun mark-vmp-ins (origin-ins insn-mem insn-index cur-insn vmp-info expr)
+  ;; (format t "vmp-info: ~a~%" vmp-info)
+  ;; (format t "insn rizinil: ~a~%" expr)
+  (let ((new-vmp-info (copy-tree vmp-info)))
+    (labels ((exists-in-vmp-info (key operand)
+               (find-if (lambda (known)
+                          (find-tree known operand :test #'equal))
+                        (getf vmp-info key)))
+             (highlight-insn ()
+               (adjoin-plist-item origin-ins :attr '(:color "#990073")))
+             (highlight-and-update-vmp-info (key &rest operands)
+               (highlight-insn)
+               (dolist (op operands)
+                 (adjoin-plist-item new-vmp-info key op)))
+             (remove-vmp-info (key operand)
+               (setf (getf new-vmp-info key)
+                     (remove-if (lambda (known)
+                                  (find-tree operand known :test #'equal))
+                                (getf new-vmp-info key)))))
+      (trivia:match expr
+        ((list 'set operand1 operand2)
+         (cond
+           ((trivia:match operand2
+              ((trivia:guard (list 'mem (list '+ base index))
+                             (and (member base (getf vmp-info :insn-mem))
+                                  (member index (getf vmp-info :insn-index))))
+               t))
+            (highlight-and-update-vmp-info :insn operand1 operand2))
+           ((string= cur-insn insn-mem)
+            (highlight-and-update-vmp-info :insn-mem operand1 operand2))
+           ((string= cur-insn insn-index)
+            (highlight-and-update-vmp-info :insn-index operand1 operand2))
+           ;; operand1 will contain new value, so need remove old info about operand1
+           ;; remove old, then add new
+           (t (loop for (key value) on '(:insn-mem () :insn-index () :insn () :op ()) by #'cddr
+                    do (when (exists-in-vmp-info key operand1)
+                         (remove-vmp-info key operand1)))
+              (loop for (key value) on '(:insn-mem () :insn-index () :insn () :op ()) by #'cddr
+                    do (when (exists-in-vmp-info key operand2)
+                         (highlight-and-update-vmp-info key operand1 operand2))))))
+        ((list* 'branch operand _)
+         (when (find-tree operand vmp-info :test #'equal)
+           (highlight-insn)))
+        ((list* 'seq operands)
+         ;; seq is multi expr, so need recursive call
+         (mapcar (lambda (e)
+                   (setf new-vmp-info
+                         ;; new-vmp-info will update every il expr, so need use new-vmp-info
+                         (mark-vmp-ins origin-ins insn-mem insn-index cur-insn new-vmp-info e)))
+                 operands))))
+    new-vmp-info))
+
+(defun mark-vmp (links &key
+                         ;; (insn-mem "0x194f0 and x12, x11, #0xffff")
+                         ;; (vmp-info '(:insn-mem (x0) :insn-index () :insn () :op ()))
+                         (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
+                         (insn-index "0x10e520 str x13, [x19, #0x68]")
+                         (cur-insn insn-mem)
+                         (vmp-info '(:insn-mem () :insn-index () :insn () :op ()))
+                         (visited (make-hash-table :test 'equal)))
+  "Mark instruction related to vmp. Add color in links attribute."
+  (let* ((*package* (find-package :trace-analyse)))
+    (loop while (let ((cur-visited (gethash cur-insn visited)))
+                  (prog1
+                      (not (and cur-visited
+                                (subsetp (getf vmp-info :insn-mem) (getf cur-visited :insn-mem) :test 'equal)
+                                (subsetp (getf vmp-info :insn-index) (getf cur-visited :insn-index) :test 'equal)
+                                (subsetp (getf vmp-info :insn) (getf cur-visited :insn) :test 'equal)
+                                (subsetp (getf vmp-info :op) (getf cur-visited :op) :test 'equal)))
+                    (setf (gethash cur-insn visited)
+                          (let ((cur-visited (gethash cur-insn visited (list :insn-mem () :insn-index () :insn () :op ()))))
+                            (list :insn-mem (union (getf vmp-info :insn-mem) (getf cur-visited :insn-mem)  :test 'equal)
+                                  :insn-index (union (getf vmp-info :insn-index) (getf cur-visited :insn-index) :test 'equal)
+                                  :insn (union (getf vmp-info :insn) (getf cur-visited :insn) :test 'equal)
+                                  :op (union (getf vmp-info :op) (getf cur-visited :op) :test 'equal))))))
+          ;; (not (member cur-insn visited))
+          do (multiple-value-bind (off insn) (get-offset-and-isn cur-insn)
+               (declare (ignore insn))
+               ;; (format t "~x " off)
+               (setf vmp-info
+                     (mark-vmp-ins (gethash cur-insn links)
+                                   insn-mem insn-index cur-insn vmp-info
+                                   (parse-rizinil
+                                    (read-from-string
+                                     (reduce (lambda (res cur)
+                                               (cl-ppcre:regex-replace-all (car cur) res (cdr cur)))
+                                             '(("\\~-" . "neg") ("\\~" . "not") ("\\|"  . "or") ("0x"   . "#x"))
+                                             :initial-value (nth-value 1 (get-offset-and-isn (rizin:il *rizin* :offset off))))))))
+               ;; (push cur-insn visited)
+               (let ((nexts (getf (gethash cur-insn links) :next)))
+                 (when (car nexts)
+                   (setf cur-insn (car nexts)))
+                 (mapc (lambda (next)
+                         (mark-vmp links
+                                   :insn-mem insn-mem
+                                   :insn-index insn-index
+                                   :cur-insn next
+                                   :vmp-info (copy-tree vmp-info)
+                                   :visited visited
+                                   ;; (copy-tree visited)
+                                   ))
+                       (cdr nexts)))))
+    links))
+
+;; (defun mark-vmp (links &key
+;;                          ;; (insn-mem "0x194f0 and x12, x11, #0xffff")
+;;                          ;; (vmp-info '(:insn-mem (x0) :insn-index () :insn () :op ()))
+
+;;                          (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
+;;                          (insn-index "0x10e520 str x13, [x19, #0x68]")
+;;                          (vmp-info '(:insn-mem () :insn-index () :insn () :op ())))
+;;   (let ((*package* (find-package :trace-analyse)))
+;;     (with-open-file (stream "resources/output-10e414-first.txt" :direction :input)
+;;       ;; (with-open-file (stream trace-file :direction :input)
+;;       (loop for cur-insn = (read-line stream nil nil)
+;;             while cur-insn
+;;             when (uiop:string-prefix-p "0x" cur-insn)
+;;               do (multiple-value-bind (off insn) (get-offset-and-isn cur-insn)
+;;                    (declare (ignore insn))
+;;                    (format t "~x " off)
+;;                    (setf vmp-info
+;;                          (mark-vmp-ins (gethash cur-insn links)
+;;                                        insn-mem insn-index cur-insn vmp-info
+;;                                        (parse-rizinil
+;;                                         (read-from-string
+;;                                          (reduce (lambda (res cur)
+;;                                                    (cl-ppcre:regex-replace-all (car cur) res (cdr cur)))
+;;                                                  '(("\\~-" . "neg")
+;;                                                    ("\\~" . "not")
+;;                                                    ("\\|"  . "or")
+;;                                                    ("0x"   . "#x"))
+;;                                                  :initial-value (nth-value 1 (get-offset-and-isn (rizin:il *rizin* :offset off)))))))))
+;;             finally (return links)))))
+
 (defclass cfg ()
   ((links :initarg :links
           :accessor cfg-links)
@@ -96,14 +299,26 @@
             (find-if (lambda (area) (string= next (car area))) (cfg-nodes graph)))
           (getf (gethash (car (last object)) (cfg-links graph)) :next)))
 
-(defun cfg ()
-  (let* ((links (get-ins-info))
-         (graph-nodes (merge-ins-block links))
-         (dgraph (cl-dot:generate-graph-from-roots (make-instance 'cfg :links links :nodes graph-nodes)
-                                                   graph-nodes
+(defun output-cfg (so-file trace-file &key need-mark-vmp output-file)
+  (setf *rizin* (rizin:rizin-open so-file))
+  (let* ((links (funcall (if need-mark-vmp #'mark-vmp #'identity)
+                         (get-ins-info trace-file)))
+         (group-nodes (merge-ins-block links))
+         (dgraph (cl-dot:generate-graph-from-roots (make-instance 'cfg :links links :nodes group-nodes)
+                                                   group-nodes
                                                    '(:rankdir "TB"
-                                                     :splines "ortho"))))
-    (cl-dot:dot-graph dgraph "test-lr.svg" :format :svg)))
+                                                     ;; :splines "ortho"
+                                                     ))))
+    ;; (maphash (lambda (k v)
+    ;;            (when (getf v :attr)
+    ;;              (format t "~a~%" k)))
+    ;;          links)
+    (when output-file
+      (cl-dot:dot-graph dgraph output-file :format :svg))
+    ;; (format t "~s~%" (ms:marshal group-nodes))
+    (rizin:quit *rizin*)
+
+    (values links group-nodes)))
 
 ;; (defmethod capstone::capstone-instruction-class :around ((engine capstone:capstone-engine))
 ;;   (if (and (eql (capstone:architecture engine) :arm64)
@@ -114,14 +329,25 @@
 ;; (defparameter engine
 ;;   (make-instance 'capstone:capstone-engine :architecture :arm64 :mode :little_endian))
 
-(defun main ()
-  (format t "trace main!!~%")
-  (let ((binary (read-ins "resources/libAPSE_8.0.0.so"))
-        (engine (make-instance 'capstone:capstone-engine
-                               :arch :arm64 :mode :little-endian)))
-    (capstone:option engine :cs-opt-detail t)
-    (format t "version: ~a ~a~%" (capstone:version) (subseq binary #x10e424 #x10e42c))
-    (format t "~s~%" (capstone:disasm engine (subseq binary #x10e424 #x10e428)))
-    ;; (format t "~s~%" (capstone:disasm engine (subseq binary #x10e4a4) :address #x10e4a4 :count 1))
-    (capstone:capstone-close engine)))
+;; (setf *rizin* (rizin:rizin-open "resources/libAPSE_8.0.0.so"))
+;; (mark-vmp (get-ins-info))
 
+(defun main ()
+  (output-cfg "resources/libAPSE_8.0.0.so" "resources/output-10e414-first.txt" :need-mark-vmp t :output-file "test-lr.svg")
+
+  ;; (setf *rizin* (rizin:rizin-open "/home/ring/reverse_workspace/Happy_New_Year_2025_Challenge/problem3/lib/arm64-v8a/libnativelib.so"))
+  ;; (output-cfg "/home/ring/reverse_workspace/Happy_New_Year_2025_Challenge/output.txt"
+  ;;             :output-file "happy-new-year-problem.svg"
+  ;;             :need-mark-vmp t)
+  ;; (rizin:quit *rizin*)
+
+  ;; (format t "trace main!!~%")
+  ;; (let ((binary (read-ins "resources/libAPSE_8.0.0.so"))
+  ;;       (engine (make-instance 'capstone:capstone-engine
+  ;;                              :arch :arm64 :mode :little-endian)))
+  ;;   (capstone:option engine :cs-opt-detail t)
+  ;;   (format t "version: ~a ~a~%" (capstone:version) (subseq binary #x10e424 #x10e42c))
+  ;;   (format t "~s~%" (capstone:disasm engine (subseq binary #x10e424 #x10e428)))
+  ;;   ;; (format t "~s~%" (capstone:disasm engine (subseq binary #x10e4a4) :address #x10e4a4 :count 1))
+  ;;   (capstone:capstone-close engine))
+  )
