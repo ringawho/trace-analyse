@@ -11,6 +11,7 @@
   :entry-point "trace-analyse:main"
 
   :depends-on (:uiop :cl-dot :cl-ppcre :trivia
+               :com.inuoe.jzon :alexandria
                :trace-analyse/capstone :trace-analyse/rizin)
   :components ((:module "src"
                 :components

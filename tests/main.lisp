@@ -6,8 +6,11 @@
 
 ;; NOTE: To run this test file, execute `(asdf:test-system :trace-analyse)' in your Lisp.
 
-(defun hash-table-equal (expected result)
+(defun hash-table-equal (expected result &key ignore-keys)
   (and (every (lambda (k)
+                (loop for ignore-key in ignore-keys
+                      do (remf (gethash k expected) ignore-key)
+                         (remf (gethash k result) ignore-key))
                 (equal (gethash k expected)
                        (gethash k result)))
               (alexandria:hash-table-keys expected))
@@ -24,5 +27,5 @@
         (trace-analyse::output-cfg "resources/libAPSE_8.0.0.so" "resources/output-10e414-first.txt" :need-mark-vmp t)
       (let* ((links (ms:unmarshal (read-from-string (uiop:read-file-string "tests/suit/links.dat"))))
              (group-nodes (ms:unmarshal (read-from-string (uiop:read-file-string "tests/suit/group-nodes.dat")))))
-        (ok (hash-table-equal links returned-links) "Links should match")
+        (ok (hash-table-equal links returned-links :ignore-keys '(:trace-value)) "Links should match")
         (ok (equal group-nodes returned-group-nodes) "Group nodes should match")))))

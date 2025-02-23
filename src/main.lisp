@@ -17,7 +17,7 @@
             while line
             when (uiop:string-prefix-p "0x" line)
               do (unless (gethash line links)
-                   (setf (gethash line links) (list :prev nil :next nil :attr nil)))
+                   (setf (gethash line links) (list :prev nil :next nil :attr nil :trace-value nil)))
                  (when previous
                    (let ((prev-entry (gethash previous links))
                          (curr-entry (gethash line links)))
@@ -25,6 +25,46 @@
                      (adjoin-plist-item curr-entry :prev previous)))
                  (setf previous line)
             finally (return links)))))
+
+(defun parse-trace-regs (regs line)
+  (let ((new-regs (com.inuoe.jzon:parse line)))
+    (if regs
+        (maphash (lambda (k v)
+                   (let ((vals (cl-ppcre:split "\\s*=>\\s*" v)))
+                     (unless (and (= 2 (length vals))
+                                  (equal (first vals) (gethash k regs)))
+                       (error (format nil "the length of vals is not equal 2, vals is ~s~%" vals)))
+                     (setf (gethash k regs) (second vals))))
+                 new-regs)
+        ;; first need clear, only keep x0~x30
+        (progn (maphash (lambda (k v)
+                          (declare (ignore v))
+                          (unless (uiop:string-prefix-p "x" k)
+                            (remhash k new-regs)))
+                        new-regs)
+               (setf regs new-regs)))
+    regs))
+
+(defun diff-alists (lst1 lst2)
+  (if (or (null lst1) (null lst2))
+      (or lst1 lst2)
+      (loop for (key . val) in lst1
+            when (equal val (cdr (assoc key lst2 :test 'equal)))
+              collect (cons key val))))
+
+(defun mark-op (links trace-file)
+  (with-open-file (stream trace-file :direction :input)
+    (loop with regs = nil
+          for line = (read-line stream nil nil)
+          while line
+          when (cl-ppcre:scan "^\\s+\\{" line)
+            do (setf regs (parse-trace-regs regs line))
+          when (uiop:string-prefix-p "0x" line)
+            do (let ((entry (gethash line links)))
+                 (setf (getf entry :trace-value)
+                       (diff-alists (getf entry :trace-value)
+                                    (alexandria:hash-table-alist regs))))
+          finally (return links))))
 
 (defun merge-ins-block (links)
   (let ((visited (make-hash-table :test 'equal))
@@ -38,10 +78,10 @@
            (loop while cur
                  do (push cur area)
                     (setf (gethash cur visited) t)
-                    (let ((prevs (getf (gethash cur links) :prev)))
-                      (setf cur (if (and (= (length prevs) 1)
-                                         (= (length (getf (gethash (first prevs) links) :next)) 1))
-                                    (first prevs)
+                    (let ((nexts (getf (gethash cur links) :next)))
+                      (setf cur (if (and (= (length nexts) 1)
+                                         (= (length (getf (gethash (first nexts) links) :prev)) 1))
+                                    (first nexts)
                                     nil))))
            (setf area (nreverse area))
            (pop area)
@@ -49,12 +89,19 @@
            (loop while cur
                  do (push cur area)
                     (setf (gethash cur visited) t)
-                    (let ((nexts (getf (gethash cur links) :next)))
-                      (setf cur (if (and (= (length nexts) 1)
-                                         (= (length (getf (gethash (first nexts) links) :prev)) 1))
-                                    (first nexts)
+                    (let ((prevs (getf (gethash cur links) :prev)))
+                      (setf cur (if (and (= (length prevs) 1)
+                                         (= (length (getf (gethash (first prevs) links) :next)) 1))
+                                    (first prevs)
                                     nil))))
-           (push (nreverse area) areas))))
+           (push (loop with common-trace-value = nil
+                       for l in area
+                       do (setf common-trace-value
+                                (diff-alists (getf (gethash l links) :trace-value)
+                                             common-trace-value))
+                       finally (return common-trace-value))
+                 area)
+           (push area areas))))
      links)
     areas))
 
@@ -261,7 +308,15 @@
                                (:font ,(getf (gethash line (cfg-links graph))
                                              :attr)
                                       ,line))))
-                  object)))
+                  (cdr object))))
+    (mapcar (lambda (reg)
+              (alexandria:when-let ((val (assoc reg (car object) :test 'equal)))
+                (push `(:tr ()
+                            (:td ((:align "left"))
+                                 (:font ((:color "#ff0000"))
+                                        ,(format nil "~s~%" val))))
+                      table-lines)))
+            '("x21" "x24"))
     (make-instance 'cl-dot:node
                    :attributes `(:label (:html ()
                                                (:table ((:border "0"))
@@ -275,25 +330,25 @@
 
 (defmethod cl-dot:graph-object-points-to ((graph cfg) (object list))
   (mapcar (lambda (next)
-            (find-if (lambda (area) (string= next (car area))) (cfg-nodes graph)))
+            (find-if (lambda (area) (string= next (cadr area))) (cfg-nodes graph)))
           (getf (gethash (car (last object)) (cfg-links graph)) :next)))
 
 (defun output-cfg (so-file trace-file &key need-mark-vmp output-file)
   (setf *rizin* (rizin:rizin-open so-file))
-  (let* ((links (funcall (if need-mark-vmp #'mark-vmp #'identity)
-                         (get-ins-info trace-file)))
-         (group-nodes (merge-ins-block links))
-         (dgraph (cl-dot:generate-graph-from-roots (make-instance 'cfg :links links :nodes group-nodes)
-                                                   group-nodes
-                                                   '(:rankdir "TB"
-                                                     ;; :splines "ortho"
-                                                     ))))
-    ;; (maphash (lambda (k v)
-    ;;            (when (getf v :attr)
-    ;;              (format t "~a~%" k)))
-    ;;          links)
+  (let* ((links (get-ins-info trace-file))
+         group-nodes)
+    (when need-mark-vmp
+      (mark-vmp links)
+      (mark-op links trace-file))
+    (setf group-nodes (merge-ins-block links))
     (when output-file
-      (cl-dot:dot-graph dgraph output-file :format :svg))
+      (cl-dot:dot-graph
+       (cl-dot:generate-graph-from-roots (make-instance 'cfg :links links :nodes group-nodes)
+                                         group-nodes
+                                         '(:rankdir "TB"
+                                           ;; :splines "ortho"
+                                           ))
+       output-file :format :svg))
     (rizin:quit *rizin*)
 
     (values links group-nodes)))
