@@ -191,7 +191,6 @@
 
 (defun mark-vmp-ins (origin-ins insn-mem insn-index cur-insn vmp-info expr)
   ;; (format t "vmp-info: ~a~%" vmp-info)
-  ;; (format t "insn rizinil: ~a~%" expr)
   (let ((new-vmp-info (copy-tree vmp-info)))
     (labels ((exists-in-vmp-info (key operand)
                (find-if (lambda (known)
@@ -257,25 +256,24 @@
                   (not (and cur-visited
                             (loop for key in '(:insn-mem :insn-index :insn :op)
                                   always (subsetp (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
-          do (multiple-value-bind (off insn) (get-offset-and-isn cur-insn)
-               (declare (ignore insn))
-               (setf vmp-info (mark-vmp-ins (gethash cur-insn links)
-                                            insn-mem insn-index cur-insn vmp-info
-                                            (get-rizinil off)))
-               (setf (gethash cur-insn visited)
-                     (let ((cur-visited (gethash cur-insn visited (list :insn-mem () :insn-index () :insn () :op ()))))
-                       (loop for key in '(:insn-mem :insn-index :insn :op)
-                             append (list key (union (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
-               (let ((nexts (getf (gethash cur-insn links) :next)))
-                 (when (car nexts)
-                   (setf cur-insn (car nexts)))
-                 (loop for next in (cdr nexts)
-                       do (mark-vmp links
-                                    :insn-mem insn-mem
-                                    :insn-index insn-index
-                                    :cur-insn next
-                                    :vmp-info (copy-tree vmp-info)
-                                    :visited visited)))))
+          do (setf vmp-info (mark-vmp-ins (gethash cur-insn links)
+                                          insn-mem insn-index cur-insn vmp-info
+                                          (get-rizinil (nth-value 0 (get-offset-and-isn cur-insn)))))
+             ;; (format t "insn rizinil: ~a ~s~%~s~%~%" cur-insn (get-rizinil (nth-value 0 (get-offset-and-isn cur-insn))) vmp-info)
+             (setf (gethash cur-insn visited)
+                   (let ((cur-visited (gethash cur-insn visited (list :insn-mem () :insn-index () :insn () :op ()))))
+                     (loop for key in '(:insn-mem :insn-index :insn :op)
+                           append (list key (union (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
+             (let ((nexts (getf (gethash cur-insn links) :next)))
+               (when (car nexts)
+                 (setf cur-insn (car nexts)))
+               (loop for next in (cdr nexts)
+                     do (mark-vmp links
+                                  :insn-mem insn-mem
+                                  :insn-index insn-index
+                                  :cur-insn next
+                                  :vmp-info (copy-tree vmp-info)
+                                  :visited visited))))
     links))
 
 ;; (defun mark-vmp (links &key (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
@@ -339,6 +337,19 @@
          group-nodes)
     (when need-mark-vmp
       (mark-vmp links)
+      (let ((pattern "\\b(?:[wx]\\d+)\\b")
+            (freq-table (make-hash-table :test 'equal))
+            op-regs)
+        (maphash (lambda (k v)
+                   (when (and (getf v :attr)
+                              (search "cmp" k))
+                     (setf op-regs (append op-regs (cl-ppcre:all-matches-as-strings pattern k)))))
+                 links)
+        (dolist (reg op-regs)
+          (incf (gethash reg freq-table 0)))
+        (format t "may be op reg: ~a~%" (sort (loop for key being the hash-keys of freq-table
+                                     collect (cons key (gethash key freq-table)))
+                               #'> :key #'cdr)))
       (mark-op links trace-file))
     (setf group-nodes (merge-ins-block links))
     (when output-file
