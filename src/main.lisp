@@ -9,22 +9,278 @@
   `(setf (getf ,lst ,key)
          (adjoin ,item (getf ,lst ,key) :test 'equal)))
 
-(defun get-ins-info (trace-file)
-  (let ((links (make-hash-table :test 'equal))
-        previous)
-    (with-open-file (stream trace-file :direction :input)
-      (loop for line = (read-line stream nil nil)
-            while line
-            when (uiop:string-prefix-p "0x" line)
-              do (unless (gethash line links)
-                   (setf (gethash line links) (list :prev nil :next nil :attr nil :trace-value nil)))
-                 (when previous
-                   (let ((prev-entry (gethash previous links))
-                         (curr-entry (gethash line links)))
-                     (adjoin-plist-item prev-entry :next line)
-                     (adjoin-plist-item curr-entry :prev previous)))
-                 (setf previous line)
-            finally (return links)))))
+(defun get-offset-and-insn (insn)
+  (destructuring-bind (offset ins) (cl-ppcre:split " " insn :limit 2)
+    (values (parse-integer offset :start 2 :radix 16)
+            ins)))
+
+(defclass instruction ()
+  ((offset :initarg :offset :reader offset)
+   (insn :initarg :insn :reader insn-value)
+   (prev :initarg :prev :accessor prev :initform nil)
+   (next :initarg :next :accessor next :initform nil)
+   (attr :initarg :attr :accessor attr :initform nil)
+   (trace :initarg :trace :accessor trace-value :initform nil)))
+
+(defun get-insn-info (trace-file)
+  (with-open-file (stream trace-file :direction :input)
+    (loop with insn-hash = (make-hash-table :test 'equal)
+          and previous = nil
+          for line = (read-line stream nil nil)
+          while line
+          when (uiop:string-prefix-p "0x" line)
+            do (unless (gethash line insn-hash)
+                 (multiple-value-bind (offset insn) (get-offset-and-insn line)
+                   ;; (format t "~s~%" line)
+                   ;; (format t "         ~s~%         ~s~%" (rizin:il *rizin* :offset offset)
+                   ;;         (data-flow (rizin:il *rizin* :offset offset)))
+                   (setf (gethash line insn-hash)
+                         (make-instance 'instruction :offset offset :insn insn))))
+               (when previous
+                 (pushnew line (next (gethash previous insn-hash)) :test 'equal)
+                 (pushnew previous (prev (gethash line insn-hash)) :test 'equal))
+               (setf previous line)
+          finally (return insn-hash))))
+
+(defun dependency-p (ele1 ele2)
+  (or (equal ele1 ele2)
+      (and (listp ele2)
+           (equal (car ele2) :mem)
+           (find-tree ele1 ele2))))
+
+(defun data-dependency (flow1 flow2 &key (direction :forward))
+  (let* ((flow1-from (getf flow1 :from))
+         (flow1-to (getf flow1 :to))
+         (flow2-from (getf flow2 :from))
+         (flow2-to (getf flow2 :to))
+         (affected (intersection flow1-to flow2-from :test 'dependency-p)))
+    (case direction
+      (:forward (values (list :from flow1-from
+                              :to (if affected
+                                      (union flow1-to flow2-to :test 'equal)
+                                      (set-difference flow1-to flow2-to :test 'equal)))
+                        affected))
+      (:backward (values (list :from (if affected
+                                         (union flow1-from (set-difference flow2-from flow1-to :test 'equal)
+                                                :test 'equal)
+                                         flow2-from)
+                               :to flow2-to)
+                         affected))
+      (otherwise (error (format nil "Invalid direction: ~a, key must be :forward and :backward.~%" direction))))))
+
+(defun data-merge (flow1 flow2)
+  (list :from (union (getf flow1 :from)
+                     (set-difference (getf flow2 :from) (getf flow1 :to) :test 'equal)
+                     :test 'equal)
+        :to (union (getf flow1 :to) (getf flow2 :to) :test 'equal)))
+
+(defun parse-mem (expr)
+  (list :mem
+        (trivia:match expr
+          ((list :+ (list :+ (list :var var) (list :bv bit1 value1))
+                 (list :bv bit2 value2))
+           (unless (= bit1 bit2)
+             (error (format nil "Parse mem expr failed ~s, different bit width~%" expr)))
+           `(:+ (:var ,var) (:bv ,bit1 ,(+ value1 value2))))
+          ;; ((list :var _) expr)
+          ;; ((list :+ (list :var _) (list :bv _ _)) expr)
+          ;; ((list :+ (list :var _) (list :var _)) expr)
+          ;; (_ (error (format nil "Parse mem expr failed ~s~%" expr)))
+          (_ expr))))
+
+(defun data-unit (expr)
+  (trivia:match expr
+    ((list :var reg) (uiop:ensure-list reg))
+    ((list :bv _ _) nil)
+    ((list :load _ mem) (list (parse-mem mem)))
+    ((list :loadw _ _ mem) (list (parse-mem mem)))
+    ((list :cast _ _ var) (data-unit var))
+    ;; is same as data-merge, without final to
+    ((list :let var value body) (union (data-unit value)
+                                       (set-difference (data-unit body) (list var))))
+    ((trivia:guard (list op value)
+                   (member op '(:msb :is_zero :! :neg)))
+     (data-unit value))
+    ((trivia:guard (list op value1 value2)
+                   (member op '(:+ :- :* :& :or :oror :^ :ule :&& :^^)))
+     (append (data-unit value1)
+             (data-unit value2)))
+    ((trivia:guard (list op value1 value2 _)
+                   (member op '(:>> :<<)))
+     (append (data-unit value1)
+             (data-unit value2)))
+    (_ (error (format nil "Parse unit failed ~s~%" expr)))))
+
+(defun data-flow (expr)
+  ;; (format t "expr: ~S~%" expr)
+  (trivia:match expr
+    ((list :storew 0 mem from-expr) (list :from (data-unit from-expr) :to (list (parse-mem mem))))
+    ((list :set reg from-expr) (list :from (data-unit from-expr) :to (list reg)))
+    ((list :jmp target) (list :from (data-unit target)))
+    ((list :branch cond b1 b2) (list :from (append (data-unit cond)
+                                                   (getf (data-merge (data-flow b1) (data-flow b2)) :from))))
+
+    ((list* :seq operands) (reduce #'data-merge
+                                   (mapcar #'data-flow operands)))
+
+    (:nop nil)
+    (_ (error (format nil "Parse failed ~s~%" expr)))))
+
+(defun valid-cmp (insn-hash k)
+  "the k is cmp ins, return t if branch depends the result of cmp"
+  (loop with cmp-entry = (gethash k insn-hash)
+        with cmp-flow = (data-flow (rizin:il *rizin* :offset (offset cmp-entry)))
+        ;; cmp hash only one next
+        with cur = (car (next cmp-entry))
+
+        while cur
+        for entry = (gethash cur insn-hash)
+        for flow = (data-flow (rizin:il *rizin* :offset (offset entry)))
+        and nexts = (next entry)
+        when (intersection (getf cmp-flow :to) (getf flow :to) :test 'equal)
+          return nil
+        when (and (intersection (getf cmp-flow :to) (getf flow :from) :test 'equal)
+                  (> (length nexts) 1))
+          return t
+        do (setf cur (when (<= (length nexts) 1)
+                       (car nexts)))))
+
+(defun show-menu (title content)
+  (format t "~%~{~8@a ~}~%" (cons "index" title))
+  (format t "~&~{~{[~6@s]~@{ ~8@a~}~}~%~}"
+          (loop for i from 0
+                for item in content
+                collect (cons i (uiop:ensure-list item)))))
+
+(defun read-regs-from-user (default-index &key multi)
+  (format t "Select regs (default=~a)~a: " default-index
+          (if multi
+              " (multi index need splited by comma or space)"
+              ""))
+  (finish-output)
+  (let ((input (string-trim "" (read-line))))
+    (if multi
+        (uiop:ensure-list
+         (if (string= input "")
+             default-index
+             (loop for index in (ppcre:split "\\s*,\\s*|\\s+" input)
+                   collect (parse-integer index))))
+        (if (string= input "")
+            default-index
+            (parse-integer input)))))
+
+(defun get-op-regs (insn-hash &key (default-index 0 default-index-p))
+  (let ((freq-hash (make-hash-table :test 'equal))
+        op-regs)
+    (loop for k being the hash-key using (hash-value v) of insn-hash
+          when (search "cmp" k)
+            do (let ((valid (valid-cmp insn-hash k))
+                     (flow (data-flow (rizin:il *rizin* :offset (offset v)))))
+                 (loop for reg in (getf flow :from)
+                       for entry = (gethash reg freq-hash (list :insn nil :freq-times 0 :valid-times 0))
+                       when valid
+                         do (incf (getf entry :valid-times))
+                       do (incf (getf entry :freq-times))
+                          (pushnew k (getf entry :insn))
+                          (setf (gethash reg freq-hash) entry))))
+    (setf op-regs (sort (alexandria:hash-table-alist freq-hash)
+                        (lambda (a b)
+                          (let ((valid-a (getf (cdr a) :valid-times))
+                                (valid-b (getf (cdr b) :valid-times))
+                                (freq-a (getf (cdr a) :freq-times))
+                                (freq-b (getf (cdr b) :freq-times)))
+                            (or (> valid-a valid-b)
+                                (and (= valid-a valid-b)
+                                     (> freq-a freq-b)))))))
+    (show-menu '("Reg" "Valid" "Freq")
+               (loop for item in op-regs
+                     collect (list (first item)
+                                   (getf (cdr item) :valid-times)
+                                   (getf (cdr item) :freq-times))))
+    (let ((select-regs (loop for index in (if default-index-p
+                                              default-index
+                                              (read-regs-from-user default-index :multi t))
+                             collect (nth index op-regs))))
+      (format t "Selected regs are: ~{~a~^, ~}~%" (mapcar #'car select-regs))
+      select-regs)))
+
+(defun get-vmp-insn-mem (insn-hash regs &key (default-index 0 default-index-p))
+  (loop for k in (mapcan (lambda (r) (getf (cdr r) :insn))
+                         regs)
+        for vmp-insn-mem = nil
+        for cmp-entry = (gethash k insn-hash)
+        for cmp-flow = (data-flow (rizin:il *rizin* :offset (offset cmp-entry)))
+        and cmp-prev = (prev cmp-entry)
+        when (= (length cmp-prev) 1)
+          do (loop with acc-flow = cmp-flow     ; accumulator flow
+                   with cur = (car cmp-prev)
+                   while cur
+                   for entry = (gethash cur insn-hash)
+                   for flow = (data-flow (rizin:il *rizin* :offset (offset entry)))
+                   and prev = (prev entry)
+                   do (multiple-value-bind (new-flow affected) (data-dependency flow acc-flow :direction :backward)
+                        (when (and affected
+                                   (some (lambda (f)
+                                           (and (listp f) (equal (car f) :mem)))
+                                         (getf new-flow :from)))
+                          (pushnew cur vmp-insn-mem :test 'equal))
+                        (setf acc-flow new-flow))
+                      (setf cur (when (= (length prev) 1)
+                                  (car prev))))
+        finally (show-menu '("" "instruction") vmp-insn-mem)
+                (let ((select-insn (nth (if default-index-p
+                                            default-index
+                                            (read-regs-from-user default-index))
+                                        vmp-insn-mem)))
+                  (format t "Selected vmp insn mem is: ~a~%" select-insn)
+                  (return select-insn))))
+
+(defun mark-vmp-instruction (insn-hash from-insn
+                             &key acc-flow
+                               (visited (make-hash-table :test 'equal))
+                               (is-first t))
+  (loop with cur-insn = from-insn
+        and cur-acc-flow = acc-flow
+        and affected = nil
+        ;; and show = nil
+
+        while cur-insn
+        for cur-flow = (data-flow (rizin:il *rizin* :offset (offset (gethash cur-insn insn-hash))))
+        and cur-insn-visited = (gethash cur-insn visited)
+        ;; do (when (uiop:string-prefix-p "0x10ed98" cur-insn)
+        ;;      (setf show t))
+        ;;    (when show
+        ;;      (format t "special insn: ~a~%   ~a~%   ~a --- ~a~%" cur-insn cur-acc-flow cur-insn-visited
+        ;;              (and cur-insn-visited
+        ;;                   (subsetp (getf cur-acc-flow :from) (getf cur-insn-visited :from)))))
+        if (and cur-insn-visited
+                (subsetp (getf cur-acc-flow :from) (getf cur-insn-visited :from))
+                (subsetp (getf cur-acc-flow :to) (getf cur-insn-visited :to)))
+          do (setf cur-insn nil)
+        else
+          do (setf (gethash cur-insn visited)
+                   (loop for key in '(:from :to)
+                         append (list key (union (getf cur-acc-flow key) (getf cur-insn-visited key) :test 'equal))))
+             (setf cur-acc-flow (gethash cur-insn visited))
+
+
+             ;; (when (uiop:string-prefix-p "0x10eb40" cur-insn)
+             ;;   (format t "0x10eb40 data flow: ~a~%   ~a~%   ~a~%~%" cur-acc-flow cur-flow (data-dependency cur-acc-flow cur-flow)))
+
+             (multiple-value-setq (cur-acc-flow affected)
+               (if (or (getf cur-acc-flow :from)
+                       (getf cur-acc-flow :to))
+                   (data-dependency cur-acc-flow cur-flow)
+                   (values cur-flow t)))
+             (when (or affected
+                       (and (equal cur-insn from-insn) is-first))
+               ;; (unless (attr (gethash cur-insn insn-hash))
+               ;;   (format t "mark vmp insn new: ~a~%" cur-insn))
+               (setf (attr (gethash cur-insn insn-hash)) '((:color "#990073"))))
+             (let ((nexts (next (gethash cur-insn insn-hash))))
+               (setf cur-insn (car nexts))
+               (loop for n in (cdr nexts)
+                     do (mark-vmp-instruction insn-hash n :acc-flow cur-acc-flow :visited visited :is-first nil)))))
 
 (defun parse-trace-regs (regs line)
   (let ((new-regs (com.inuoe.jzon:parse line)))
@@ -52,7 +308,7 @@
             when (equal val (cdr (assoc key lst2 :test 'equal)))
               collect (cons key val))))
 
-(defun mark-op (links trace-file)
+(defun mark-op (insn-hash trace-file)
   (with-open-file (stream trace-file :direction :input)
     (loop with regs = nil
           for line = (read-line stream nil nil)
@@ -60,64 +316,50 @@
           when (cl-ppcre:scan "^\\s+\\{" line)
             do (setf regs (parse-trace-regs regs line))
           when (uiop:string-prefix-p "0x" line)
-            do (let ((entry (gethash line links)))
-                 (setf (getf entry :trace-value)
-                       (diff-alists (getf entry :trace-value)
+            do (let ((entry (gethash line insn-hash)))
+                 (setf (trace-value entry)
+                       (diff-alists (trace-value entry)
                                     (alexandria:hash-table-alist regs))))
-          finally (return links))))
+          finally (return insn-hash))))
 
-(defun merge-ins-block (links)
+(defun merge-ins-block (insn-hash)
   (let ((visited (make-hash-table :test 'equal))
         areas)
     (maphash
      (lambda (line val)
        (declare (ignore val))
        (unless (gethash line visited)
-         (let (area
-               (cur line))
-           (loop while cur
+         (let (area)
+           (loop with cur = line
+                 while cur
                  do (push cur area)
                     (setf (gethash cur visited) t)
-                    (let ((nexts (getf (gethash cur links) :next)))
+                    (let ((nexts (next (gethash cur insn-hash))))
                       (setf cur (if (and (= (length nexts) 1)
-                                         (= (length (getf (gethash (first nexts) links) :prev)) 1))
+                                         (= (length (prev (gethash (first nexts) insn-hash))) 1))
                                     (first nexts)
                                     nil))))
            (setf area (nreverse area))
            (pop area)
-           (setf cur line)
-           (loop while cur
+           (loop with cur = line
+                 while cur
                  do (push cur area)
                     (setf (gethash cur visited) t)
-                    (let ((prevs (getf (gethash cur links) :prev)))
+                    (let ((prevs (prev (gethash cur insn-hash))))
                       (setf cur (if (and (= (length prevs) 1)
-                                         (= (length (getf (gethash (first prevs) links) :next)) 1))
+                                         (= (length (next (gethash (first prevs) insn-hash))) 1))
                                     (first prevs)
                                     nil))))
            (push (loop with common-trace-value = nil
                        for l in area
                        do (setf common-trace-value
-                                (diff-alists (getf (gethash l links) :trace-value)
+                                (diff-alists (trace-value (gethash l insn-hash))
                                              common-trace-value))
                        finally (return common-trace-value))
                  area)
            (push area areas))))
-     links)
+     insn-hash)
     areas))
-
-(defun read-ins (so-filename)
-  (with-open-file (stream so-filename
-                          :direction :input
-                          :element-type '(unsigned-byte 8))
-    (let* ((size (file-length stream))
-           (buffer (make-array size :element-type '(unsigned-byte 8))))
-      (read-sequence buffer stream)
-      buffer)))
-
-(defun get-offset-and-isn (insn)
-  (destructuring-bind (offset ins) (cl-ppcre:split " " insn :limit 2)
-    (values (parse-integer offset :start 2 :radix 16)
-            ins)))
 
 (defun find-tree (node tree &key (test #'eql))
   (if (atom tree)
@@ -187,7 +429,7 @@
     (reduce (lambda (res cur)
               (cl-ppcre:regex-replace-all (car cur) res (cdr cur)))
             '(("\\~-" . "neg") ("\\~" . "not") ("\\|"  . "or") ("0x"   . "#x"))
-            :initial-value (nth-value 1 (get-offset-and-isn (rizin:il *rizin* :offset off)))))))
+            :initial-value (nth-value 1 (get-offset-and-insn (rizin:il *rizin* :offset off)))))))
 
 (defun mark-vmp-ins (origin-ins insn-mem insn-index cur-insn vmp-info expr)
   ;; (format t "vmp-info: ~a~%" vmp-info)
@@ -238,15 +480,15 @@
                         (mark-vmp-ins origin-ins insn-mem insn-index cur-insn new-vmp-info e))))))
     new-vmp-info))
 
-(defun mark-vmp (links &key
-                         ;; (insn-mem "0x194f0 and x12, x11, #0xffff")
-                         ;; (vmp-info '(:insn-mem (x0) :insn-index () :insn () :op ()))
-                         (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
-                         (insn-index "0x10e520 str x13, [x19, #0x68]")
-                         (cur-insn insn-mem)
-                         (vmp-info '(:insn-mem () :insn-index () :insn () :op ()))
-                         (visited (make-hash-table :test 'equal)))
-  "Mark instruction related to vmp. Add color in links attribute."
+(defun mark-vmp (insn-hash &key
+                             ;; (insn-mem "0x194f0 and x12, x11, #0xffff")
+                             ;; (vmp-info '(:insn-mem (x0) :insn-index () :insn () :op ()))
+                             (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
+                             (insn-index "0x10e520 str x13, [x19, #0x68]")
+                             (cur-insn insn-mem)
+                             (vmp-info '(:insn-mem () :insn-index () :insn () :op ()))
+                             (visited (make-hash-table :test 'equal)))
+  "Mark instruction related to vmp. Add color in insn-hash attribute."
   ;; if visited is list, it will be simple, but will lose some mark (link direct between different operator)
   ;; 1. simple check (not (member cur-insn visited))
   ;; 2. simple push alreay visited insn (push cur-insn visited)
@@ -256,27 +498,27 @@
                   (not (and cur-visited
                             (loop for key in '(:insn-mem :insn-index :insn :op)
                                   always (subsetp (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
-          do (setf vmp-info (mark-vmp-ins (gethash cur-insn links)
+          do (setf vmp-info (mark-vmp-ins (gethash cur-insn insn-hash)
                                           insn-mem insn-index cur-insn vmp-info
-                                          (get-rizinil (nth-value 0 (get-offset-and-isn cur-insn)))))
-             ;; (format t "insn rizinil: ~a ~s~%~s~%~%" cur-insn (get-rizinil (nth-value 0 (get-offset-and-isn cur-insn))) vmp-info)
+                                          (get-rizinil (nth-value 0 (get-offset-and-insn cur-insn)))))
+             (format t "insn rizinil: ~a ~s~%~s~%~%" cur-insn (rizin:il *rizin* :offset (nth-value 0 (get-offset-and-insn cur-insn))) vmp-info)
              (setf (gethash cur-insn visited)
                    (let ((cur-visited (gethash cur-insn visited (list :insn-mem () :insn-index () :insn () :op ()))))
                      (loop for key in '(:insn-mem :insn-index :insn :op)
                            append (list key (union (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
-             (let ((nexts (getf (gethash cur-insn links) :next)))
+             (let ((nexts (getf (gethash cur-insn insn-hash) :next)))
                (when (car nexts)
                  (setf cur-insn (car nexts)))
                (loop for next in (cdr nexts)
-                     do (mark-vmp links
+                     do (mark-vmp insn-hash
                                   :insn-mem insn-mem
                                   :insn-index insn-index
                                   :cur-insn next
                                   :vmp-info (copy-tree vmp-info)
                                   :visited visited))))
-    links))
+    insn-hash))
 
-;; (defun mark-vmp (links &key (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
+;; (defun mark-vmp (insn-hash &key (insn-mem "0x10e51c ldr x8, [x19, #0x28]")
 ;;                          (insn-index "0x10e520 str x13, [x19, #0x68]")
 ;;                          (vmp-info '(:insn-mem () :insn-index () :insn () :op ())))
 ;;   (let ((*package* (find-package :trace-analyse)))
@@ -285,16 +527,16 @@
 ;;       (loop for cur-insn = (read-line stream nil nil)
 ;;             while cur-insn
 ;;             when (uiop:string-prefix-p "0x" cur-insn)
-;;               do (multiple-value-bind (off insn) (get-offset-and-isn cur-insn)
+;;               do (multiple-value-bind (off insn) (get-offset-and-insn cur-insn)
 ;;                    (declare (ignore insn))
-;;                    (setf vmp-info (mark-vmp-ins (gethash cur-insn links)
+;;                    (setf vmp-info (mark-vmp-ins (gethash cur-insn insn-hash)
 ;;                                                 insn-mem insn-index cur-insn vmp-info
 ;;                                                 (get-rizinil off))))
-;;             finally (return links)))))
+;;             finally (return insn-hash)))))
 
 (defclass cfg ()
-  ((links :initarg :links
-          :accessor cfg-links)
+  ((insn-hash :initarg :links
+              :accessor cfg-links)
    (nodes :initarg :nodes
           :accessor cfg-nodes)))
 
@@ -303,8 +545,7 @@
           (mapcar (lambda (line)
                     `(:tr ()
                           (:td ((:align "left"))
-                               (:font ,(getf (gethash line (cfg-links graph))
-                                             :attr)
+                               (:font ,(attr (gethash line (cfg-links graph)))
                                       ,line))))
                   (cdr object))))
     (mapcar (lambda (reg)
@@ -319,6 +560,7 @@
                    :attributes `(:label (:html ()
                                                (:table ((:border "0"))
                                                        ,@table-lines))
+                                        ;; (:left ,(format nil "~{~a~%~}" object))
                                         ;; (list :left (format nil "~{~a~%~}" object))
                                         :style :filled
                                         :fontname "monospace"
@@ -329,40 +571,38 @@
 (defmethod cl-dot:graph-object-points-to ((graph cfg) (object list))
   (mapcar (lambda (next)
             (find-if (lambda (area) (string= next (cadr area))) (cfg-nodes graph)))
-          (getf (gethash (car (last object)) (cfg-links graph)) :next)))
+          (next (gethash (car (last object)) (cfg-links graph)))))
 
 (defun output-cfg (so-file trace-file &key need-mark-vmp output-file)
   (setf *rizin* (rizin:rizin-open so-file))
-  (let* ((links (get-ins-info trace-file))
+  (let* ((insn-hash (get-insn-info trace-file))
          group-nodes)
     (when need-mark-vmp
-      (mark-vmp links)
-      (let ((pattern "\\b(?:[wx]\\d+)\\b")
-            (freq-table (make-hash-table :test 'equal))
-            op-regs)
-        (maphash (lambda (k v)
-                   (when (and (getf v :attr)
-                              (search "cmp" k))
-                     (setf op-regs (append op-regs (cl-ppcre:all-matches-as-strings pattern k)))))
-                 links)
-        (dolist (reg op-regs)
-          (incf (gethash reg freq-table 0)))
-        (format t "may be op reg: ~a~%" (sort (loop for key being the hash-keys of freq-table
-                                     collect (cons key (gethash key freq-table)))
-                               #'> :key #'cdr)))
-      (mark-op links trace-file))
-    (setf group-nodes (merge-ins-block links))
+      (let* ((regs (get-op-regs insn-hash :default-index '(0 1)))
+             (vmp-insn (get-vmp-insn-mem insn-hash regs :default-index 0)))
+        (mark-vmp-instruction insn-hash vmp-insn)
+        (mark-op insn-hash trace-file)))
+    (setf group-nodes (merge-ins-block insn-hash))
+
     (when output-file
       (cl-dot:dot-graph
-       (cl-dot:generate-graph-from-roots (make-instance 'cfg :links links :nodes group-nodes)
+       (cl-dot:generate-graph-from-roots (make-instance 'cfg :links insn-hash :nodes group-nodes)
                                          group-nodes
-                                         '(:rankdir "TB"
-                                           ;; :splines "ortho"
-                                           ))
+                                         ;; :splines "ortho"
+                                         '(:rankdir "TB"))
        output-file :format :svg))
     (rizin:quit *rizin*)
 
-    (values links group-nodes)))
+    (values insn-hash group-nodes)))
+
+;; (defun read-ins (so-filename)
+;;   (with-open-file (stream so-filename
+;;                           :direction :input
+;;                           :element-type '(unsigned-byte 8))
+;;     (let* ((size (file-length stream))
+;;            (buffer (make-array size :element-type '(unsigned-byte 8))))
+;;       (read-sequence buffer stream)
+;;       buffer)))
 
 ;; (defmethod capstone::capstone-instruction-class :around ((engine capstone:capstone-engine))
 ;;   (if (and (eql (capstone:architecture engine) :arm64)
@@ -374,7 +614,7 @@
 ;;   (make-instance 'capstone:capstone-engine :architecture :arm64 :mode :little_endian))
 
 ;; (setf *rizin* (rizin:rizin-open "resources/libAPSE_8.0.0.so"))
-;; (mark-vmp (get-ins-info))
+;; (mark-vmp (get-insn-info))
 
 (defun main ()
   (output-cfg "resources/libAPSE_8.0.0.so" "resources/output-10e414-first.txt" :need-mark-vmp t :output-file "test-lr.svg")

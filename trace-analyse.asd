@@ -21,7 +21,7 @@
 (defsystem "trace-analyse/tests"
   :author ""
   :license ""
-  :depends-on (:trace-analyse :rove :marshal)
+  :depends-on (:trace-analyse :rove :marshal :alexandria)
   :components ((:module "tests"
                 :components
                 ((:file "main"))))
@@ -48,7 +48,7 @@
   :version "0.0.1"
   :author "ring"
   :license ""
-  :depends-on (:uiop)
+  :depends-on (:uiop :cl-ppcre)
   :components ((:module "rizin"
                 :components
                 ((:file "rizin"))))

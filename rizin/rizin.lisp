@@ -35,9 +35,9 @@
                    :err-output err-output)))
 
 (defgeneric cmd (r cmd-str &key offset)
-  (:method ((r rizin) (cmd-str string) &key (offset 0 offset-p))
+  (:method ((r rizin) (cmd-str string) &key (offset nil offset-p))
     (when offset-p
-      (cmd r (format nil "s ~a" offset)))
+      (setf cmd-str (format nil "~a @ ~a" cmd-str offset)))
     (with-slots (input output err-output) r
       (write-line cmd-str input)
       (force-output input)
@@ -47,12 +47,24 @@
       (string-trim '(#\Space #\Tab #\Newline)
                    (uiop:read-null-terminated-string output)))))
 
+(defgeneric il-raw (r &key size offset)
+  (:method ((r rizin) &key (size 1) offset)
+    (cmd r (format nil "aoi ~a" size) :offset offset)))
+
+(defun expr-to-keywords (expr)
+  (cond
+    ((symbolp expr) (intern (symbol-name expr) :keyword))
+    ((atom expr) expr)
+    (t (mapcar #'expr-to-keywords expr))))
+
 (defgeneric il (r &key size offset)
-  (:method ((r rizin) &key (size 1) (offset 0 offset-p))
-    (let ((cmd-str (format nil "aoi ~a" size)))
-      (if offset-p
-          (cmd r cmd-str :offset offset)
-          (cmd r cmd-str)))))
+  (:method ((r rizin) &key (size 1) offset)
+    (expr-to-keywords
+     (read-from-string
+      (reduce (lambda (res cur)
+                (cl-ppcre:regex-replace-all (car cur) res (cdr cur)))
+              '(("\\~-" . "neg") ("\\~" . "not") ("\\|" . "or") ("0x" . "#x"))
+              :initial-value (nth 1 (cl-ppcre:split " " (il-raw r :size size :offset offset) :limit 2)))))))
 
 (defgeneric quit (r)
   (:method ((r rizin))
