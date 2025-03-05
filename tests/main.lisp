@@ -6,17 +6,31 @@
 
 ;; NOTE: To run this test file, execute `(asdf:test-system :trace-analyse)' in your Lisp.
 
+(defmethod ms:class-persistant-slots ((self trace-analyse::instruction))
+  ;; don't persistant trace
+  '(trace-analyse::offset
+    trace-analyse::insn
+    trace-analyse::prev
+    trace-analyse::next
+    trace-analyse::mark-type))
+
+(defmethod instruction-equal (insn1 insn2)
+  (loop for k in '(trace-analyse::offset
+                   trace-analyse::insn-value
+                   trace-analyse::prev
+                   trace-analyse::next
+                   trace-analyse::mark-type)
+        always (equal (funcall k insn1)
+                      (funcall k insn2))))
+
 (defun set-equal (expr1 expr2)
   (and (set-difference expr1 expr2 :test 'equal)
        (set-difference expr2 expr1 :test 'equal)))
 
-(defun hash-table-equal (expected result &key ignore-keys)
+(defun hash-table-equal (expected result)
   (and (every (lambda (k)
-                (loop for ignore-key in ignore-keys
-                      do (remf (gethash k expected) ignore-key)
-                         (remf (gethash k result) ignore-key))
-                (equal (gethash k expected)
-                       (gethash k result)))
+                (instruction-equal (gethash k expected)
+                                   (gethash k result)))
               (alexandria:hash-table-keys expected))
        (equal (alexandria:hash-table-keys expected)
               (alexandria:hash-table-keys result))))
@@ -47,12 +61,6 @@
         (trace-analyse::output-cfg "resources/libAPSE_8.0.0.so" "resources/output-10e414-first.txt" :need-mark-vmp t)
       (let* ((links (ms:unmarshal (read-from-string (uiop:read-file-string "tests/suit/links.dat"))))
              (group-nodes (ms:unmarshal (read-from-string (uiop:read-file-string "tests/suit/group-nodes.dat")))))
-        (maphash (lambda (k v)
-                   ;; transfer instance to list
-                   (setf (gethash k returned-links)
-                         (list :prev (trace-analyse::prev v)
-                               :next (trace-analyse::next v)
-                               :attr (trace-analyse::attr v))))
-                 returned-links)
-        (ok (hash-table-equal links returned-links :ignore-keys '(:trace-value)) "Links should match")
+        ;; (format t "~s~%" (ms:marshal returned-links))
+        (ok (hash-table-equal links returned-links) "Links should match")
         (ok (equal group-nodes (reverse (mapcar #'trace-analyse::insn-lst returned-group-nodes))) "Group nodes should match")))))

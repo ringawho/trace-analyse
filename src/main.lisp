@@ -19,7 +19,7 @@
    (insn :initarg :insn :reader insn-value)
    (prev :initarg :prev :accessor prev :initform nil)
    (next :initarg :next :accessor next :initform nil)
-   (attr :initarg :attr :accessor attr :initform nil)
+   (mark-type :initarg :mark-type :accessor mark-type :initform nil)
    (trace :initarg :trace :accessor trace-value :initform nil)))
 
 (defclass insn-block ()
@@ -278,9 +278,9 @@
                    (values cur-flow t)))
              (when (or affected
                        (and (equal cur-insn from-insn) is-first))
-               ;; (unless (attr (gethash cur-insn insn-hash))
+               ;; (unless (mark-type (gethash cur-insn insn-hash))
                ;;   (format t "mark vmp insn new: ~a~%" cur-insn))
-               (setf (attr (gethash cur-insn insn-hash)) '((:color "#990073"))))
+               (setf (mark-type (gethash cur-insn insn-hash)) t))
              (let ((nexts (next (gethash cur-insn insn-hash))))
                (setf cur-insn (car nexts))
                (loop for n in (cdr nexts)
@@ -490,8 +490,8 @@
                             (loop for key in '(:insn-mem :insn-index :insn :op)
                                   always (subsetp (getf vmp-info key) (getf cur-visited key) :test 'equal)))))
           do (setf vmp-info (mark-vmp-insn (gethash cur-insn insn-hash)
-                                          insn-mem insn-index cur-insn vmp-info
-                                          (get-rizinil (nth-value 0 (get-offset-and-insn cur-insn)))))
+                                           insn-mem insn-index cur-insn vmp-info
+                                           (get-rizinil (nth-value 0 (get-offset-and-insn cur-insn)))))
              (format t "insn rizinil: ~a ~s~%~s~%~%" cur-insn (rizin:il *rizin* :offset (nth-value 0 (get-offset-and-insn cur-insn))) vmp-info)
              (setf (gethash cur-insn visited)
                    (let ((cur-visited (gethash cur-insn visited (list :insn-mem () :insn-index () :insn () :op ()))))
@@ -536,7 +536,8 @@
           (mapcar (lambda (line)
                     `(:tr ()
                           (:td ((:align "left"))
-                               (:font ,(attr (gethash line (cfg-links graph)))
+                               (:font ,(when (mark-type (gethash line (cfg-links graph)))
+                                         '((:color "#990073")))
                                       ,line))))
                   (insn-lst object))))
     (mapcar (lambda (reg)
