@@ -22,16 +22,19 @@
    (mark-type :initarg :mark-type :accessor mark-type :initform nil)
    (trace :initarg :trace :accessor trace-value :initform nil)))
 
-(defclass insn-block ()
+(defclass insn-nodes ()
   ((insn-lst :initarg :insn-lst :reader insn-lst)
-   (trace :initarg :trace :reader common-trace)))
+   (trace :initarg :trace :accessor common-trace :initform nil)))
 
 (defun get-insn-info (trace-file)
   (with-open-file (stream trace-file :direction :input)
     (loop with insn-hash = (make-hash-table :test 'equal)
           and previous = nil
+          and regs = nil
           for line = (read-line stream nil nil)
           while line
+          when (cl-ppcre:scan "^\\s+\\{" line)
+            do (setf regs (parse-trace-regs regs line))
           when (uiop:string-prefix-p "0x" line)
             do (unless (gethash line insn-hash)
                  (multiple-value-bind (offset insn) (get-offset-and-insn line)
@@ -43,6 +46,10 @@
                (when previous
                  (pushnew line (next (gethash previous insn-hash)) :test 'equal)
                  (pushnew previous (prev (gethash line insn-hash)) :test 'equal))
+               (let ((entry (gethash line insn-hash)))
+                 (setf (trace-value entry)
+                       (diff-alists (trace-value entry)
+                                    (alexandria:hash-table-alist regs))))
                (setf previous line)
           finally (return insn-hash))))
 
@@ -312,23 +319,9 @@
             when (equal val (cdr (assoc key lst2 :test 'equal)))
               collect (cons key val))))
 
-(defun mark-common-trace-value (insn-hash trace-file)
-  (with-open-file (stream trace-file :direction :input)
-    (loop with regs = nil
-          for line = (read-line stream nil nil)
-          while line
-          when (cl-ppcre:scan "^\\s+\\{" line)
-            do (setf regs (parse-trace-regs regs line))
-          when (uiop:string-prefix-p "0x" line)
-            do (let ((entry (gethash line insn-hash)))
-                 (setf (trace-value entry)
-                       (diff-alists (trace-value entry)
-                                    (alexandria:hash-table-alist regs))))
-          finally (return insn-hash))))
-
-(defun merge-insn-block (insn-hash)
+(defun merge-insn-nodes (insn-hash)
   (let ((visited (make-hash-table :test 'equal)))
-    (flet ((merge-func (start-line &key (collect #'next)
+    (flet ((merge-func (start-line &key collect
                         &aux (reverse-collect (if (equal collect #'next) #'prev #'next)))
              (loop with cur = start-line
                    while cur
@@ -344,13 +337,9 @@
                                       nil))))))
       (loop for line being the hash-key of insn-hash
             unless (gethash line visited)
-              collect (let* ((area (append (reverse (merge-func line :collect #'prev))
-                                           (merge-func line :collect #'next)))
-                             (trace (reduce #'diff-alists area
-                                            :key (lambda (l) (trace-value (gethash l insn-hash))))))
-                        (make-instance 'insn-block
-                                       :insn-lst area
-                                       :trace trace))))))
+              collect (make-instance 'insn-nodes
+                                     :insn-lst (append (reverse (merge-func line :collect #'prev))
+                                                       (merge-func line :collect #'next)))))))
 
 (defun find-tree (node tree &key (test #'eql))
   (if (atom tree)
@@ -531,36 +520,33 @@
    (nodes :initarg :nodes
           :accessor cfg-nodes)))
 
-(defmethod cl-dot:graph-object-node ((graph cfg) (object insn-block))
+(defmethod cl-dot:graph-object-node ((graph cfg) (object insn-nodes))
   (let ((table-lines
-          (mapcar (lambda (line)
-                    `(:tr ()
-                          (:td ((:align "left"))
-                               (:font ,(when (mark-type (gethash line (cfg-links graph)))
-                                         '((:color "#990073")))
-                                      ,line))))
-                  (insn-lst object))))
-    (mapcar (lambda (reg)
-              (alexandria:when-let ((val (assoc reg (common-trace object) :test 'equal)))
-                (push `(:tr ()
-                            (:td ((:align "left"))
-                                 (:font ((:color "#ff0000"))
-                                        ,(format nil "~s~%" val))))
-                      table-lines)))
-            '("x21" "x24"))
+          (append (loop for l in (common-trace object)
+                        collect `(:tr ()
+                                      (:td ((:align "left"))
+                                           (:font ((:color "#ff0000"))
+                                                  ,(format nil "~s~%" l)))))
+                  (loop for line in (insn-lst object)
+                        collect `(:tr ()
+                                      (:td ((:align "left"))
+                                           (:font ,(when (mark-type (gethash line (cfg-links graph)))
+                                                     '((:color "#990073")))
+                                                  ,line)))))))
     (make-instance 'cl-dot:node
-                   :attributes `(:label (:html ()
-                                               (:table ((:border "0"))
-                                                       ,@table-lines))
-                                        ;; (:left ,(format nil "~{~a~%~}" object))
-                                        ;; (list :left (format nil "~{~a~%~}" object))
-                                        :style :filled
-                                        :fontname "monospace"
-                                        :shape :rect
-                                        :style (:filled :rounded)
-                                        :fillcolor "#eeeefa"))))
+                   :attributes `(:label
+                                 (:html ()
+                                        (:table ((:border "0"))
+                                                ,@table-lines))
+                                 ;; (:left ,(format nil "~{~a~%~}" object))
+                                 ;; (list :left (format nil "~{~a~%~}" object))
+                                 :style :filled
+                                 :fontname "monospace"
+                                 :shape :rect
+                                 :style (:filled :rounded)
+                                 :fillcolor "#eeeefa"))))
 
-(defmethod cl-dot:graph-object-points-to ((graph cfg) (object insn-block))
+(defmethod cl-dot:graph-object-points-to ((graph cfg) (object insn-nodes))
   (mapcar (lambda (next)
             (find-if (lambda (area) (string= next (car (insn-lst area))))
                      (cfg-nodes graph)))
@@ -569,13 +555,25 @@
 (defun output-cfg (so-file trace-file &key need-mark-vmp output-file)
   (setf *rizin* (rizin:rizin-open so-file))
   (let* ((insn-hash (get-insn-info trace-file))
-         group-nodes)
+         (group-nodes (merge-insn-nodes insn-hash)))
     (when need-mark-vmp
       (let* ((regs (get-op-regs insn-hash :default-index '(0 1)))
              (vmp-insn (get-vmp-insn-mem insn-hash regs :default-index 0)))
-        (mark-vmp-instruction insn-hash vmp-insn)
-        (mark-common-trace-value insn-hash trace-file)))
-    (setf group-nodes (merge-insn-block insn-hash))
+        (mark-vmp-instruction insn-hash vmp-insn)))
+
+    ;; TODO: nodes in same path will be spearte, so need traverse from start.
+    (loop for nodes in group-nodes
+          do (setf (common-trace nodes)
+                   (remove-if-not (lambda (c) (member (car c) '("x21" "x24") :test 'equal))
+                                  (reduce #'diff-alists (insn-lst nodes)
+                                          :key (lambda (l) (and (mark-type (gethash l insn-hash))
+                                                                (trace-value (gethash l insn-hash)))))))
+             (when (common-trace nodes)
+               (format t "~s~%~{~a~%~}~%"
+                       (common-trace nodes)
+                       (loop for l in (insn-lst nodes)
+                             when (mark-type (gethash l insn-hash))
+                               collect l))))
 
     (when output-file
       (cl-dot:dot-graph

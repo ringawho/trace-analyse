@@ -12,16 +12,19 @@
     trace-analyse::insn
     trace-analyse::prev
     trace-analyse::next
-    trace-analyse::mark-type))
+    trace-analyse::mark-type
+    trace-analyse::trace))
 
 (defmethod instruction-equal (insn1 insn2)
-  (loop for k in '(trace-analyse::offset
-                   trace-analyse::insn-value
-                   trace-analyse::prev
-                   trace-analyse::next
-                   trace-analyse::mark-type)
-        always (equal (funcall k insn1)
-                      (funcall k insn2))))
+  (and insn1 insn2
+       (loop for k in '(trace-analyse::offset
+                        trace-analyse::insn-value
+                        trace-analyse::prev
+                        trace-analyse::next
+                        trace-analyse::mark-type
+                        trace-analyse::trace-value)
+             always (equal (funcall k insn1)
+                           (funcall k insn2)))))
 
 (defun set-equal (expr1 expr2)
   (and (set-difference expr1 expr2 :test 'equal)
@@ -62,5 +65,8 @@
       (let* ((links (ms:unmarshal (read-from-string (uiop:read-file-string "tests/suit/links.dat"))))
              (group-nodes (ms:unmarshal (read-from-string (uiop:read-file-string "tests/suit/group-nodes.dat")))))
         ;; (format t "~s~%" (ms:marshal returned-links))
+        ;; (format t "~s~%" (ms:marshal links))
+        ;; (format t "~s~%" (ms:marshal (mapcar #'trace-analyse::insn-lst returned-group-nodes)))
+        ;; (format t "~s~%" group-nodes)
         (ok (hash-table-equal links returned-links) "Links should match")
-        (ok (equal group-nodes (reverse (mapcar #'trace-analyse::insn-lst returned-group-nodes))) "Group nodes should match")))))
+        (ok (equal group-nodes (mapcar #'trace-analyse::insn-lst returned-group-nodes)) "Group nodes should match")))))
