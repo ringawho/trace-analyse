@@ -24,6 +24,7 @@
 
 (defclass insn-nodes ()
   ((insn-lst :initarg :insn-lst :reader insn-lst)
+   (vmp-insn-lst :initarg :vmp-insn-lst :accessor vmp-insn-lst :initform nil)
    (trace :initarg :trace :accessor common-trace :initform nil)))
 
 (defun get-insn-info (trace-file)
@@ -342,6 +343,41 @@
                                      :insn-lst (append (reverse (merge-func line :collect #'prev))
                                                        (merge-func line :collect #'next)))))))
 
+(defun mark-vmp-insn-in-op (group-nodes insn-hash regs)
+  "Get common value trace, and get vmp-path in op path."
+  ;; TODO: nodes in same path will be spearte, so need traverse from start.
+  (loop with cmp-insn = (loop for reg in regs append (getf (cdr reg) :insn))
+        for nodes in group-nodes
+        do (setf (vmp-insn-lst nodes)
+                 (loop with flow = nil
+                       and affected = nil
+
+                       for l in (insn-lst nodes)
+                       for entry = (gethash l insn-hash)
+                       for cur-flow = (data-flow (rizin:il *rizin* :offset (offset entry)))
+                       when (and (mark-type (gethash l insn-hash))
+                                 flow)
+                         do (multiple-value-setq (flow affected) (data-dependency flow cur-flow))
+
+                       when (mark-type (gethash l insn-hash))
+                         if (or (member l cmp-insn :test #'equal)
+                                affected)
+                           do (setq flow cur-flow)
+                       else
+                         collect l))
+           (setf (common-trace nodes)
+                 (and (vmp-insn-lst nodes)
+                      (remove-if-not (lambda (c) (member (car c)
+                                                         (mapcar #'car regs)
+                                                         :test #'equal))
+                                     (reduce #'diff-alists (insn-lst nodes)
+                                             :key (lambda (l) (and (mark-type (gethash l insn-hash))
+                                                                   (trace-value (gethash l insn-hash))))))))
+           (when (common-trace nodes)
+             (format t "~s~%~{~a~%~}~%"
+                     (common-trace nodes)
+                     (vmp-insn-lst nodes)))))
+
 (defun find-tree (node tree &key (test #'eql))
   (if (atom tree)
       (funcall test node tree)
@@ -395,22 +431,7 @@
       (let* ((regs (get-op-regs insn-hash :default-index '(0 1)))
              (vmp-insn (get-vmp-insn-mem insn-hash regs :default-index 0)))
         (mark-vmp-instruction insn-hash vmp-insn)
-        ;; TODO: nodes in same path will be spearte, so need traverse from start.
-        (format t "~a~%~a~%" regs group-nodes)
-        (loop for nodes in group-nodes
-              do (setf (common-trace nodes)
-                       (remove-if-not (lambda (c) (member (car c)
-                                                          (mapcar #'car regs)
-                                                          :test 'equal))
-                                      (reduce #'diff-alists (insn-lst nodes)
-                                              :key (lambda (l) (and (mark-type (gethash l insn-hash))
-                                                                    (trace-value (gethash l insn-hash)))))))
-                 (when (common-trace nodes)
-                   (format t "~s~%~{~a~%~}~%"
-                           (common-trace nodes)
-                           (loop for l in (insn-lst nodes)
-                                 when (mark-type (gethash l insn-hash))
-                                   collect l))))))
+        (mark-vmp-insn-in-op group-nodes insn-hash regs)))
 
     (when output-file
       (cl-dot:dot-graph
