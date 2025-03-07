@@ -218,8 +218,8 @@
       select-regs)))
 
 (defun get-vmp-insn-mem (insn-hash regs &key (default-index 0 default-index-p))
-  (loop for k in (mapcan (lambda (r) (getf (cdr r) :insn))
-                         regs)
+  (loop for k in (loop for r in regs
+                       append (getf (cdr r) :insn))
         for vmp-insn-mem = nil
         for cmp-entry = (gethash k insn-hash)
         for cmp-flow = (data-flow (rizin:il *rizin* :offset (offset cmp-entry)))
@@ -343,40 +343,63 @@
                                      :insn-lst (append (reverse (merge-func line :collect #'prev))
                                                        (merge-func line :collect #'next)))))))
 
-(defun mark-vmp-insn-in-op (group-nodes insn-hash regs)
-  "Get common value trace, and get vmp-path in op path."
-  ;; TODO: nodes in same path will be spearte, so need traverse from start.
-  (loop with cmp-insn = (loop for reg in regs append (getf (cdr reg) :insn))
-        for nodes in group-nodes
-        do (setf (vmp-insn-lst nodes)
-                 (loop with flow = nil
-                       and affected = nil
+(defun mark-vmp-insn-in-op (insn-hash vmp-insn regs)
+  "Get common value trace, and get vmp-path in op path.
 
-                       for l in (insn-lst nodes)
-                       for entry = (gethash l insn-hash)
-                       for cur-flow = (data-flow (rizin:il *rizin* :offset (offset entry)))
-                       when (and (mark-type (gethash l insn-hash))
-                                 flow)
-                         do (multiple-value-setq (flow affected) (data-dependency flow cur-flow))
+1. Find which is major op and which is minor op.
+2. Get all vmp insn and op value in op path."
+  (loop with pending = (list (list vmp-insn nil nil))
+        and visited = (make-hash-table :test #'equal)
+        and affected = nil
+        and op-path-hash = (make-hash-table :test #'equal)
 
-                       when (mark-type (gethash l insn-hash))
-                         if (or (member l cmp-insn :test #'equal)
-                                affected)
-                           do (setq flow cur-flow)
-                       else
-                         collect l))
-           (setf (common-trace nodes)
-                 (and (vmp-insn-lst nodes)
-                      (remove-if-not (lambda (c) (member (car c)
-                                                         (mapcar #'car regs)
-                                                         :test #'equal))
-                                     (reduce #'diff-alists (insn-lst nodes)
-                                             :key (lambda (l) (and (mark-type (gethash l insn-hash))
-                                                                   (trace-value (gethash l insn-hash))))))))
-           (when (common-trace nodes)
-             (format t "~s~%~{~a~%~}~%"
-                     (common-trace nodes)
-                     (vmp-insn-lst nodes)))))
+        while pending
+        for (cur-insn flow first-cmp) = (pop pending)
+        for entry = (gethash cur-insn insn-hash)
+        for cur-flow = (data-flow (rizin:il *rizin* :offset (offset entry)))
+        when (mark-type entry)
+          do ;; if cur-insn is op cmp insn, then reg is op reg, else nil
+             (let ((reg (loop for r in regs
+                              for insns = (getf (cdr r) :insn)
+                              when (member cur-insn insns :test #'equal)
+                                return (car r))))
+               ;; first-cmp is plist, key is reg, value is first cmp insn with this reg
+               ;; if already has cmp-reg, current reg is subop
+               ;; so need store cmp-reg value which exists as condition
+               ;; Example: '(:X21 ("0x10e5f8 cmp w21, #0x27")
+               ;;            :X24 ("0x10e6a8 cmp w24, #0x1b" (:X21 . "0x12")))
+               (when (and reg
+                          (not (getf first-cmp reg)))
+                 (setf (getf first-cmp reg)
+                       (cons cur-insn
+                             (loop for (k v) on first-cmp by #'cddr   ; condition
+                                   collect (assoc k (trace-value entry))))))
+
+               ;; calc op cmp insn affected
+               (when flow
+                 (multiple-value-setq (flow affected) (data-dependency flow cur-flow)))
+               ;; record op cmp insn
+               (when reg
+                 (setq flow cur-flow))
+
+               ;; ensure cur-insn is in op path (all op reg value is fixed)
+               (when (and (not reg)
+                          (not affected)
+                          first-cmp
+                          (loop for (k v) on first-cmp by #'cddr
+                                always (assoc k (trace-value entry))))
+                 (let ((op-path (loop for (k v) on first-cmp by #'cddr
+                                      collect (assoc k (trace-value entry)))))
+                   (push cur-insn (gethash op-path
+                                           op-path-hash)))))
+
+        do (loop for n in (next entry)
+                 unless (gethash n visited)
+                   do (setf (gethash n visited) t)
+                      (push (list n flow first-cmp) pending))
+        finally (loop for k being the hash-key using (hash-value v) of op-path-hash
+                      ;; value need reverse
+                      do (format t "~s~%~{~a~%~}~%" k (reverse v)))))
 
 (defun find-tree (node tree &key (test #'eql))
   (if (atom tree)
@@ -431,7 +454,7 @@
       (let* ((regs (get-op-regs insn-hash :default-index '(0 1)))
              (vmp-insn (get-vmp-insn-mem insn-hash regs :default-index 0)))
         (mark-vmp-instruction insn-hash vmp-insn)
-        (mark-vmp-insn-in-op group-nodes insn-hash regs)))
+        (mark-vmp-insn-in-op insn-hash vmp-insn regs)))
 
     (when output-file
       (cl-dot:dot-graph
