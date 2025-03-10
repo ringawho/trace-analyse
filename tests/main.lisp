@@ -22,9 +22,7 @@
                         trace-analyse::prev
                         trace-analyse::next
                         trace-analyse::mark-type
-                        ;; TODO: trace-value is diff (alist key), keyword vs string
-                        ;; trace-analyse::trace-value
-                        )
+                        trace-analyse::trace-value)
              always (equal (funcall k insn1)
                            (funcall k insn2)))))
 

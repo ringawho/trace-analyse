@@ -5,14 +5,24 @@
 
 (defparameter *rizin* nil)
 
-(defmacro adjoin-plist-item (lst key item)
-  `(setf (getf ,lst ,key)
-         (adjoin ,item (getf ,lst ,key) :test 'equal)))
-
 (defun get-offset-and-insn (insn)
   (destructuring-bind (offset insn) (cl-ppcre:split " " insn :limit 2)
     (values (parse-integer offset :start 2 :radix 16)
             insn)))
+
+(defun diff-alists (lst1 lst2)
+  (if (or (null lst1) (null lst2))
+      (or lst1 lst2)
+      (loop for (key . val) in lst1
+            when (equal val (cdr (assoc key lst2 :test 'equal)))
+              collect (cons key val))))
+
+(defun find-tree (node tree &key (test #'eql))
+  (if (atom tree)
+      (funcall test node tree)
+      (or (funcall test node tree)
+          (find-tree node (car tree) :test test)
+          (find-tree node (cdr tree) :test test))))
 
 (defclass instruction ()
   ((offset :initarg :offset :reader offset)
@@ -138,6 +148,70 @@
 
     (:nop nil)
     (_ (error (format nil "Parse failed ~s~%" expr)))))
+
+(defun insn-regs-read (expr)
+  (loop for f in (trivia:match expr
+                   ;; Example:
+                   ;;   insn: 0x10fdd0 str x9, [x23]
+                   ;;   data-flow (:from (:x9) :to (:mem (:var :x23)))
+                   ;;   regs-read is '(:x9 :x23), is different with the :from of data-flow
+                   ((list :storew 0 mem from-expr) (append (list (parse-mem mem)) (data-unit from-expr)))
+                   (_ (getf (data-flow expr) :from)))
+        append (if (and (listp f) (equal (car f) :mem))
+                   (data-unit (cadr f))
+                   (list f))))
+
+(defun format-mem (expr context)
+  (format nil "[~a]" (format-unit expr context)))
+
+(defun format-reg (reg context)
+  (destructuring-bind (hook base) context
+    (if hook
+        (let ((i (position reg hook)))
+          (unless i
+            (error (format nil "Format reg (~a) error~%" i)))
+          (format nil "{~a}" (+ i base)))
+        reg)))
+
+(defun format-unit (expr context)
+  (trivia:match expr
+    ((list :var reg) (format-reg reg context))
+    ((list :bv _ num) (format nil "0x~x" num))
+    ((list :load _ mem) (format-mem mem context))
+    ((list :loadw _ _ mem) (format-mem mem context))
+    ((list :cast _ _ var) (format-unit var context))
+    ;; is same as data-merge, without final to
+    ;; ((list :let var value body) (union (format-unit value)
+    ;;                                    (set-difference (format-unit body) (list var))))
+    ((trivia:guard (list op value)
+                   (member op '(:msb :is_zero :! :neg)))
+     (format nil "~a ~a" op (format-unit value context)))
+    ((trivia:guard (list op value1 value2)
+                   (member op '(:+ :- :* :& :or :oror :^ :ule :&& :^^)))
+     (format nil "~a ~a ~a" (format-unit value1 context) op (format-unit value2 context)))
+    ((trivia:guard (list op value1 value2 _)
+                   (member op '(:>> :<<)))
+     (format nil "~a ~a ~a" (format-unit value1 context) op (format-unit value2 context)))
+    (_ (error (format nil "Parse unit failed ~s~%" expr)))))
+
+(defun format-il-to-equation (expr context &key lastp)
+  (let ((to-context (cons (when lastp (car context))
+                          (cdr context))))
+    (trivia:match expr
+      ((list :storew 0 mem from-expr)
+       (list :from (format-unit from-expr context)
+             :to (format-mem mem to-context)))
+      ((list :set reg from-expr)
+       (list :from (format-unit from-expr context) :to (format-reg reg to-context)))
+      ;; ((list :jmp target) (list :from (format-unit target)))
+      ;; ((list :branch cond b1 b2) (list :from (append (format-unit cond)
+      ;;                                                (getf (data-merge (data-flow b1) (data-flow b2)) :from))))
+
+      ;; ((list* :seq operands) (reduce #'data-merge
+      ;;                                (mapcar #'data-flow operands)))
+
+      ;; (:nop nil)
+      (_ (error (format nil "Parse failed ~s~%" expr))))))
 
 (defun valid-cmp (insn-hash k)
   "the k is cmp insn, return t if branch depends the result of cmp"
@@ -314,13 +388,6 @@
                (setf regs new-regs)))
     regs))
 
-(defun diff-alists (lst1 lst2)
-  (if (or (null lst1) (null lst2))
-      (or lst1 lst2)
-      (loop for (key . val) in lst1
-            when (equal val (cdr (assoc key lst2 :test 'equal)))
-              collect (cons key val))))
-
 (defun merge-insn-nodes (insn-hash)
   (let ((visited (make-hash-table :test 'equal)))
     (flet ((merge-func (start-line &key collect
@@ -389,24 +456,121 @@
                           (loop for (k v) on first-cmp by #'cddr
                                 always (assoc k (trace-value entry))))
                  (let ((op-path (loop for (k v) on first-cmp by #'cddr
-                                      collect (assoc k (trace-value entry)))))
+                                      for op-value = (cdr (assoc k (trace-value entry)))
+                                      collect (list k op-value (car v)))))
                    (push cur-insn (gethash op-path
                                            op-path-hash)))))
 
         do (loop for n in (next entry)
                  unless (gethash n visited)
                    do (setf (gethash n visited) t)
-                      (push (list n flow first-cmp) pending))
-        finally (loop for k being the hash-key using (hash-value v) of op-path-hash
-                      ;; value need reverse
-                      do (format t "~s~%~{~a~%~}~%" k (reverse v)))))
+                      (push (list n (copy-tree flow) (copy-tree first-cmp)) pending))
+        finally (return op-path-hash)))
 
-(defun find-tree (node tree &key (test #'eql))
-  (if (atom tree)
-      (funcall test node tree)
-      (or (funcall test node tree)
-          (find-tree node (car tree) :test test)
-          (find-tree node (cdr tree) :test test))))
+(defun generate-op-lst (insn-hash op-path-hash)
+  (loop with nested-path-hash = (make-hash-table)
+        for rk being the hash-key using (hash-value rv) of op-path-hash
+        ;; key and value need reverse
+        for k = (reverse rk)
+        for v = (reverse rv)
+        do (setf (gethash rk op-path-hash) v)
+           (handler-case
+               (let ((hook (generate-hook insn-hash v)))
+                 (loop with cur-path-hash = nested-path-hash
+                       for rest-op on k
+                       for (op-reg op-value-str) = (car rest-op)
+                       for op-value = (parse-integer op-value-str :start 2 :radix 16)
+                       if (cdr rest-op)
+                         do (unless (gethash op-value cur-path-hash)
+                              (setf (gethash op-value cur-path-hash)
+                                    (list :op (list op-value)
+                                          :hook (list
+                                                 (list :insn (offset (gethash (third (second rest-op)) insn-hash))
+                                                       :reg (loop for r in (list (car (second rest-op)))
+                                                                  collect (string-downcase (symbol-name r)))
+                                                       :subop (make-hash-table))))))
+                            (setf cur-path-hash
+                                  (getf (car
+                                         (getf (gethash op-value cur-path-hash)
+                                               :hook))
+                                        :subop))
+                       else
+                         do (setf (gethash op-value cur-path-hash)
+                                  (list :op (list op-value)
+                                        :hook (loop for h in (car hook)
+                                                    collect (list :insn (car h)
+                                                                  :reg (loop for r in (cadr h)
+                                                                             collect (string-downcase (symbol-name r)))))
+                                        :format (cadr hook)))))
+             (error (e)
+               (format t "~s~%~{~a~%~}" k v)
+               (format t "Can not generate hook: ~%    ~a~%" e)))
+        finally (format t "~a~%" (com.inuoe.jzon:stringify (convert-jzon-struct nested-path-hash)
+                                                           :pretty t))))
+
+(defun convert-jzon-struct (nested-path-hash)
+  ;; 1. the op hash only keep value
+  ;; 2. the op hash value need convert to hash-table
+  ;; 3. each elements in the :hook of op hash value need convert to hash-table
+  ;; 4. :subop of element need to call recursive
+  (loop for k being the hash-key using (hash-value v) of nested-path-hash
+        do (setf (getf v :hook)
+                 (loop for h in (getf v :hook)
+                       when (getf h :subop)
+                         do (setf (getf h :subop)
+                                  (convert-jzon-struct (getf h :subop)))
+                       collect (alexandria:plist-hash-table h)))
+        collect (alexandria:plist-hash-table v)))
+
+(defun generate-hook (insn-hash v)
+  (loop with equation-hash = (make-hash-table)
+        ;; loop regs in one op-path
+        for rest on v
+        for line = (car rest)
+        for lastp = (null (cdr rest))
+        for entry = (gethash line insn-hash)
+        for il = (rizin:il *rizin* :offset (offset entry))
+        for regs-read = (insn-regs-read il)
+        for equation = (format-il-to-equation il (list regs-read base) :lastp lastp)
+        do (setf (gethash (getf equation :to) equation-hash)
+                 (calc-new-equations equation-hash (getf equation :from) regs-read base))
+           ;; (format t "stored equations: ~a ~s~%" line (gethash (getf equation :to) equation-hash))
+        collect (list (offset entry) regs-read) into hook-lst
+        sum (length regs-read) into base
+        when lastp
+          do (when (> (hash-table-count equation-hash) 1)
+               (error "There is not only one out expression.~%"))
+          and return (let ((last-to (getf equation :to)))
+                       (list hook-lst
+                             (format nil "~a~{ = ~a~}" last-to (gethash last-to equation-hash))))))
+
+(defun calc-new-equations (equation-hash equation regs-read base)
+  (loop with new-equations = (list equation)
+        for i from base
+        for r in regs-read
+        when (gethash r equation-hash)
+          do ;; (format t "new-equations: ~s ~s ~s~%" i new-equations (gethash r equation-hash))
+             (setf new-equations (calc-new-equations-one-reg new-equations (gethash r equation-hash) i))
+             (remhash r equation-hash)
+             ;; (format t "new-equations-res: ~s~%" new-equations)
+        finally (return new-equations)))
+
+(defun calc-new-equations-one-reg (equations reg-equation i)
+  (cons (car equations)
+        (loop for index from 0 below (max (length (cdr equations))
+                                          (length reg-equation))
+              for expr-lst = (cdr equations) then (cdr expr-lst)
+              for reg-expr-lst = reg-equation then (cdr reg-expr-lst)
+              for expr = (or (car expr-lst) expr (car equations))
+              for reg-expr = (or (car reg-expr-lst) reg-expr)
+              ;; do (format t "replace one reg: ~s ~s ~s ~s~%" i expr reg-expr (cl-ppcre:regex-replace-all
+              ;;                                                                (format nil "\\{~a\\}" i)
+              ;;                                                                expr
+              ;;                                                                reg-expr))
+              collect (cl-ppcre:regex-replace-all
+                       (format nil "\\{~a\\}" i)
+                       expr
+                       reg-expr))))
 
 (defclass cfg ()
   ((insn-hash :initarg :links
@@ -454,7 +618,9 @@
       (let* ((regs (get-op-regs insn-hash :default-index '(0 1)))
              (vmp-insn (get-vmp-insn-mem insn-hash regs :default-index 0)))
         (mark-vmp-instruction insn-hash vmp-insn)
-        (mark-vmp-insn-in-op insn-hash vmp-insn regs)))
+        (generate-op-lst
+         insn-hash
+         (mark-vmp-insn-in-op insn-hash vmp-insn regs))))
 
     (when output-file
       (cl-dot:dot-graph
