@@ -113,16 +113,19 @@
 
 (defun data-unit (expr)
   (trivia:match expr
+    (:false nil)
     ((list :var reg) (uiop:ensure-list reg))
     ((list :bv _ _) nil)
     ((list :load _ mem) (list (parse-mem mem)))
     ((list :loadw _ _ mem) (list (parse-mem mem)))
     ((list :cast _ _ var) (data-unit var))
+    ((list :ite cond value1 value2)
+     (append (data-unit cond) (data-unit value1) (data-unit value2)))
     ;; is same as data-merge, without final to
     ((list :let var value body) (union (data-unit value)
                                        (set-difference (data-unit body) (list var))))
     ((trivia:guard (list op value)
-                   (member op '(:msb :is_zero :! :neg)))
+                   (member op '(:msb :is_zero :! :neg :not)))
      (data-unit value))
     ((trivia:guard (list op value1 value2)
                    (member op '(:+ :- :* :& :or :oror :^ :ule :&& :^^)))
@@ -137,6 +140,7 @@
 (defun data-flow (expr)
   ;; (format t "expr: ~S~%" expr)
   (trivia:match expr
+    ((list :store 0 mem from-expr) (list :from (data-unit from-expr) :to (list (parse-mem mem))))
     ((list :storew 0 mem from-expr) (list :from (data-unit from-expr) :to (list (parse-mem mem))))
     ((list :set reg from-expr) (list :from (data-unit from-expr) :to (list reg)))
     ((list :jmp target) (list :from (data-unit target)))
@@ -239,7 +243,7 @@
                 for item in content
                 collect (cons i (uiop:ensure-list item)))))
 
-(defun read-regs-from-user (default-index &key multi)
+(defun read-regs-from-user (&key multi (default-index 0))
   (format t "Select regs (default=~a)~a: " default-index
           (if multi
               " (multi index need splited by comma or space)"
@@ -256,7 +260,7 @@
             default-index
             (parse-integer input)))))
 
-(defun get-op-regs (insn-hash &key (default-index 0 default-index-p))
+(defun get-op-regs (insn-hash &key default-index)
   (let ((freq-hash (make-hash-table :test 'equal))
         op-regs)
     (loop for k being the hash-key using (hash-value v) of insn-hash
@@ -284,14 +288,13 @@
                      collect (list (first item)
                                    (getf (cdr item) :valid-times)
                                    (getf (cdr item) :freq-times))))
-    (let ((select-regs (loop for index in (if default-index-p
-                                              default-index
-                                              (read-regs-from-user default-index :multi t))
+    (let ((select-regs (loop for index in (or default-index
+                                              (read-regs-from-user :multi t))
                              collect (nth index op-regs))))
       (format t "Selected regs are: ~{~a~^, ~}~%" (mapcar #'car select-regs))
       select-regs)))
 
-(defun get-vmp-insn-mem (insn-hash regs &key (default-index 0 default-index-p))
+(defun get-vmp-insn-mem (insn-hash regs &key default-index)
   (loop for k in (loop for r in regs
                        append (getf (cdr r) :insn))
         for vmp-insn-mem = nil
@@ -315,9 +318,8 @@
                       (setf cur (when (= (length prev) 1)
                                   (car prev))))
         finally (show-menu '("" "instruction") vmp-insn-mem)
-                (let ((select-insn (nth (if default-index-p
-                                            default-index
-                                            (read-regs-from-user default-index))
+                (let ((select-insn (nth (or default-index
+                                            (read-regs-from-user))
                                         vmp-insn-mem)))
                   (format t "Selected vmp insn mem is: ~a~%" select-insn)
                   (return select-insn))))
@@ -485,7 +487,7 @@
                               (setf (gethash op-value cur-path-hash)
                                     (list :op (list op-value)
                                           :hook (list
-                                                 (list :insn (offset (gethash (third (second rest-op)) insn-hash))
+                                                 (list :ins (offset (gethash (third (second rest-op)) insn-hash))
                                                        :reg (loop for r in (list (car (second rest-op)))
                                                                   collect (string-downcase (symbol-name r)))
                                                        :subop (make-hash-table))))))
@@ -498,15 +500,23 @@
                          do (setf (gethash op-value cur-path-hash)
                                   (list :op (list op-value)
                                         :hook (loop for h in (car hook)
-                                                    collect (list :insn (car h)
+                                                    collect (list :ins (car h)
                                                                   :reg (loop for r in (cadr h)
                                                                              collect (string-downcase (symbol-name r)))))
                                         :format (cadr hook)))))
              (error (e)
                (format t "~s~%~{~a~%~}" k v)
                (format t "Can not generate hook: ~%    ~a~%" e)))
-        finally (format t "~a~%" (com.inuoe.jzon:stringify (convert-jzon-struct nested-path-hash)
-                                                           :pretty t))))
+        finally (format t "~a~%"
+                        ;; replace num use hex
+                        (cl-ppcre:regex-replace-all
+                         "(?<!\\{)\\b(\\d+)\\b(?!\\})"
+                         (com.inuoe.jzon:stringify (convert-jzon-struct nested-path-hash)
+                                                   :pretty t)
+                         #'(lambda (match &rest registers)
+                             (declare (ignore registers))
+                             (format nil "0x~x" (parse-integer match)))
+                         :simple-calls t))))
 
 (defun convert-jzon-struct (nested-path-hash)
   ;; 1. the op hash only keep value
@@ -610,13 +620,13 @@
                      (cfg-nodes graph)))
           (next (gethash (car (last (insn-lst object))) (cfg-links graph)))))
 
-(defun output-cfg (so-file trace-file &key need-mark-vmp output-file)
+(defun output-cfg (so-file trace-file &key need-mark-vmp output-file default-vmp-regs-index default-vmp-insn-index)
   (setf *rizin* (rizin:rizin-open so-file))
   (let* ((insn-hash (get-insn-info trace-file))
          (group-nodes (merge-insn-nodes insn-hash)))
     (when need-mark-vmp
-      (let* ((regs (get-op-regs insn-hash :default-index '(0 1)))
-             (vmp-insn (get-vmp-insn-mem insn-hash regs :default-index 0)))
+      (let* ((regs (get-op-regs insn-hash :default-index default-vmp-regs-index))
+             (vmp-insn (get-vmp-insn-mem insn-hash regs :default-index default-vmp-insn-index)))
         (mark-vmp-instruction insn-hash vmp-insn)
         (generate-op-lst
          insn-hash
@@ -633,12 +643,54 @@
 
     (values insn-hash group-nodes)))
 
-(defun main ()
-  (output-cfg "resources/libAPSE_8.0.0.so" "resources/output-10e414-first.txt" :need-mark-vmp t :output-file "test-lr.svg")
+(defun trace-analyse/options ()
+  (list
+   (clingon:make-option
+    :flag
+    :description "the switch of analyse vmp"
+    :short-name #\a
+    :long-name "analyse-vmp"
+    :initial-value nil
+    :key :analyse-vmp)
+   (clingon:make-option
+    :filepath
+    :description "the so file path"
+    :short-name #\s
+    :long-name "so-file"
+    :required t
+    :key :so-file)
+   (clingon:make-option
+    :filepath
+    :description "the trace file path"
+    :short-name #\t
+    :long-name "trace-file"
+    :required t
+    :key :trace-file)
+   (clingon:make-option
+    :filepath
+    :description "the output file path of cfg"
+    :short-name #\o
+    :long-name "output-file"
+    :key :output)))
 
-  ;; (setf *rizin* (rizin:rizin-open "/home/ring/reverse_workspace/Happy_New_Year_2025_Challenge/problem3/lib/arm64-v8a/libnativelib.so"))
-  ;; (output-cfg "/home/ring/reverse_workspace/Happy_New_Year_2025_Challenge/output.txt"
-  ;;             :output-file "happy-new-year-problem.svg"
-  ;;             :need-mark-vmp t)
-  ;; (rizin:quit *rizin*)
+(defun trace-analyse/handler (cmd)
+  (format t "cmd: ~a~%" (clingon:getopt cmd :so-file))
+  (output-cfg (clingon:getopt cmd :so-file)
+              (clingon:getopt cmd :trace-file)
+              :need-mark-vmp
+              (clingon:getopt cmd :analyse-vmp)
+              :output-file
+              (clingon:getopt cmd :output)))
+
+(defun main ()
+  (clingon:run
+   (clingon:make-command
+    :name "Trace Analyse"
+    :description "analyse frida trace"
+    :options (trace-analyse/options)
+    :handler #'trace-analyse/handler))
+
+  ;; (output-cfg "resources/libAPSE_8.0.0.so" "resources/output-10e414-first.txt"
+  ;;             :need-mark-vmp t :output-file "test-lr.svg"
+  ;;             :default-vmp-regs-index '(0 1) :default-vmp-insn-index 0)
   )
