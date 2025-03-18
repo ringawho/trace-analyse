@@ -30,12 +30,11 @@
    (prev :initarg :prev :accessor prev :initform nil)
    (next :initarg :next :accessor next :initform nil)
    (mark-type :initarg :mark-type :accessor mark-type :initform nil)
-   (trace :initarg :trace :accessor trace-value :initform nil)))
+   (trace :initarg :trace :accessor trace-value :initform nil)
+   (op-path :accessor op-path-value :initform nil)))
 
 (defclass insn-nodes ()
-  ((insn-lst :initarg :insn-lst :reader insn-lst)
-   (vmp-insn-lst :initarg :vmp-insn-lst :accessor vmp-insn-lst :initform nil)
-   (trace :initarg :trace :accessor common-trace :initform nil)))
+  ((insn-lst :initarg :insn-lst :reader insn-lst)))
 
 (defun get-insn-info (trace-file)
   (with-open-file (stream trace-file :direction :input)
@@ -460,8 +459,9 @@
                  (let ((op-path (loop for (k v) on first-cmp by #'cddr
                                       for op-value = (cdr (assoc k (trace-value entry)))
                                       collect (list k op-value (car v)))))
-                   (push cur-insn (gethash op-path
-                                           op-path-hash)))))
+                   (setf (op-path-value (gethash cur-insn insn-hash))
+                         (mapcar (lambda (c) (subseq c 0 2)) op-path))
+                   (push cur-insn (gethash op-path op-path-hash)))))
 
         do (loop for n in (next entry)
                  unless (gethash n visited)
@@ -590,11 +590,15 @@
 
 (defmethod cl-dot:graph-object-node ((graph cfg) (object insn-nodes))
   (let ((table-lines
-          (append (loop for l in (common-trace object)
-                        collect `(:tr ()
-                                      (:td ((:align "left"))
-                                           (:font ((:color "#ff0000"))
-                                                  ,(format nil "~s~%" l)))))
+          (append (remove-duplicates
+                   (loop for line in (insn-lst object)
+                         for op-path = (op-path-value (gethash line (cfg-links graph)))
+                         when op-path
+                           collect `(:tr ()
+                                         (:td ((:align "left"))
+                                              (:font ((:color "#ff0000"))
+                                                     ,(format nil "~s~%" op-path)))))
+                   :test #'equal)
                   (loop for line in (insn-lst object)
                         collect `(:tr ()
                                       (:td ((:align "left"))
@@ -674,7 +678,6 @@
     :key :output)))
 
 (defun trace-analyse/handler (cmd)
-  (format t "cmd: ~a~%" (clingon:getopt cmd :so-file))
   (output-cfg (clingon:getopt cmd :so-file)
               (clingon:getopt cmd :trace-file)
               :need-mark-vmp
